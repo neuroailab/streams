@@ -1,5 +1,5 @@
 from __future__ import division, print_function, absolute_import
-import sys, subprocess, tempfile, time, glob, os, inspect, importlib
+import sys, subprocess, time, glob, os, inspect, random, string
 
 import dill
 import tqdm
@@ -18,7 +18,9 @@ class Parallel(object):
         self.n_iter = n_iter
         self.backend = backend
         self.timer = timer
-        self.save_path = os.getcwd()
+
+        template = 'parallel_' + self.pid + '_{}'
+        self.save_path = os.path.join(os.getcwd(), template)
 
         frame = inspect.getouterframes(inspect.currentframe())[1][0]
         self._caller = inspect.getmodule(frame)
@@ -26,7 +28,7 @@ class Parallel(object):
 
     def __call__(self, *args, **kwargs):
         if self.n_jobs == 1:  # run normally
-            res = [self.func(*args, **kwargs) for i in tqdm.trange(self.n_iter)]
+            res = [self.func(i, *args, **kwargs) for i in tqdm.trange(self.n_iter)]
         else:
             if self.backend == 'sbatch':
                 res = self._sbatch_run(*args, **kwargs)
@@ -36,39 +38,43 @@ class Parallel(object):
                 raise ValueError
         return res
 
+    @property
+    def pid(self):
+        if not hasattr(self, '_pid'):
+            if not hasattr(self, 'save_path'):
+                self.save_path = os.getcwd()
+            pid = self.id_generator(n=6)
+            filelist = glob.glob(os.path.join(os.path.dirname(self.save_path), '*'))
+            while any([pid in os.path.basename(f) for f in filelist]):
+                pid = self.id_generator(m=6)
+            self._pid = pid
+        return self._pid
+
+    def id_generator(self, n=6, chars=string.ascii_lowercase):
+        return ''.join(random.SystemRandom().choice(chars) for _ in range(n))
+
     def _func_writer(self, iterno, *args, **kwargs):
         res = self.func(iterno, *args, **kwargs)
-        name = os.path.splitext(os.path.basename(sys.argv[0]))[0].split('_')[-1]
-        tempf = tempfile.NamedTemporaryFile(
-                                    prefix='parallel_output_{}_'.format(name),
-                                    suffix='_{}.pkl'.format(iterno),
-                                    delete=False, dir=self.save_path)
-        dill.dump(res, tempf)
-        tempf.close()
+        tempf = self.save_path.format('output_{}.pkl'.format(iterno))
+        dill.dump(res, open(tempf, 'wb'))
 
-    def gen_sbatch_array(self, callable_path, array=(0,100)):
-        sbatch_script = tempfile.NamedTemporaryFile(prefix='parallel_sbatch_', suffix='.sh',
-                                                    delete=False, dir=self.save_path)
+    def gen_sbatch_array(self, array=(0,100)):
+        tempf = self.save_path.format('slurm_%a.out')
+        callable_path = self.save_path.format('script.py')
         script = ('#!/bin/bash\n'
                   '#SBATCH --array={}-{}\n'
                   '#SBATCH --time=01:00:00\n'
                   '#SBATCH --ntasks=1\n'
-                  '#SBATCH --output="parallel_slurm_%A-%a.out"\n'
-                  'python "{}" $SLURM_ARRAY_TASK_ID'.format(array[0], array[1]-1, callable_path)
+                  '#SBATCH --output="{}"\n'
+                  'python "{}" $SLURM_ARRAY_TASK_ID'.format(
+                      array[0], array[1]-1, tempf, callable_path)
                   )
-        sbatch_script.write(script)
-        sbatch_script.close()
-        return sbatch_script
+        with open(self.save_path.format('sbatch.sh'), 'wb') as f:
+            f.write(script)
 
     def gen_sbatch_python(self, *args, **kwargs):
-        func_pkl = tempfile.NamedTemporaryFile(prefix='parallel_vars_', suffix='.pkl',
-                                               delete=False, dir=self.save_path)
-        dill.dump([self._caller, self._func_writer, args, kwargs], func_pkl)
-        func_pkl.close()
-
-        sbatch_python = tempfile.NamedTemporaryFile(prefix='parallel_script_', suffix='.py',
-                                                    delete=False, dir=self.save_path)
-
+        tempf = self.save_path.format('vars.pkl')
+        dill.dump([self._caller, self._func_writer, args, kwargs], open(tempf, 'wb'))
         # add all modules
         global_vars = ''
         for global_var in dir(self._caller):
@@ -82,14 +88,13 @@ class Parallel(object):
                   '    mod, func, args, kwargs = dill.load(open("{}"))\n{}'
                   '    func(iterno, *args, **kwargs)\n'
                   'if __name__ == "__main__":\n'
-                  '    run(int(sys.argv[1]))'.format(self._caller_path, func_pkl.name, global_vars)
+                  '    run(int(sys.argv[1]))'.format(self._caller_path, tempf, global_vars)
                   )
-        sbatch_python.write(script)
-        sbatch_python.close()
-        return func_pkl, sbatch_python
+        with open(self.save_path.format('script.py'), 'wb') as f:
+            f.write(script)
 
     def _run_from_pickle(self, *args, **kwargs):
-        func_pkl, sbatch_python = self.gen_sbatch_python(*args, **kwargs)
+        self.gen_sbatch_python(*args, **kwargs)
         for i in range(self.n_iter):
             subprocess.check_call('python {} {}'.format(sbatch_python.name, i).split())
         os.remove(func_pkl.name)
@@ -98,14 +103,13 @@ class Parallel(object):
         return self._combine_results('parallel_output_{}_*_{}.pkl'.format(p))
 
     def _sbatch_run(self, *args, **kwargs):
-        func_pkl, sbatch_python = self.gen_sbatch_python(*args, **kwargs)
-
-        sbatch_script_names = []
+        self.gen_sbatch_python(*args, **kwargs)
         for batch_no in range((self.n_jobs - 1) // self.n_iter + 1):
             array = (batch_no * self.n_jobs, (batch_no+1) * self.n_jobs)
-            sbatch_script = self.gen_sbatch_array(sbatch_python.name, array=array)
-            sbatch_script_names.append(sbatch_script.name)
-            out = subprocess.check_output(['sbatch', sbatch_script.name])
+            self.gen_sbatch_array(array=array)
+
+            # run the script and wait for it to complete
+            out = subprocess.check_output(['sbatch', self.save_path.format('sbatch.sh')])
             out_str = 'Submitted batch job '
             assert out[:len(out_str)] == out_str
             job_id = out.split('\n')[0][len(out_str):]
@@ -120,29 +124,32 @@ class Parallel(object):
                 else:
                     break
 
-        p = os.path.splitext(os.path.basename(sbatch_python.name))[0].split('_')[-1]
-        output_format = 'parallel_output_{}'.format(p) + '_*_{}.pkl'
-        res_file = glob.glob(os.path.join(self.save_path, output_format.format(0)))
-        assert len(res_file) == 1
-        results = self._combine_results(output_format)
+            # check if output file was created; if not, there must have been an error
+            for i in range(array[0], array[1]):
+                outf = self.save_path.format('output_{}.pkl'.format(i))
+                if not os.path.isfile(outf):
+                    with open(self.save_path.format('slurm_{}.out'.format(i))) as f:
+                        msg = f.read()
+                    print(msg)
+                    raise Exception('Output file {} not found. See error log above.'.format(outf))
 
-        for name in sbatch_script_names:
-            os.remove(name)
-        for i in range(self.n_iter):
-            f = os.path.join(self.save_path, 'parallel_slurm_{}-{}.out'.format(job_id, i))
-            os.remove(f)
-        os.remove(func_pkl.name)
-        os.remove(sbatch_python.name)
+        results = self._combine_results()
+        self._cleanup()
         return results
 
-    def _combine_results(self, output_format):
+    def _cleanup(self):
+        for fname in ['sbatch.sh', 'script.py', 'vars.pkl']:
+            os.remove(self.save_path.format(fname))
+        for fname in ['slurm_{}.out', 'output_{}.pkl']:
+            for i in range(self.n_iter):
+                os.remove(self.save_path.format(fname).format(i))
+
+    def _combine_results(self):
         results = []
         for i in range(self.n_iter):
-            res_file = glob.glob(os.path.join(self.save_path, output_format.format(i)))
-            assert len(res_file) == 1
-            res = dill.load(open(res_file[0]))
+            outf = self.save_path.format('output_{}.pkl'.format(i))
+            res = dill.load(open(outf))
             results.append(res)
-            os.remove(res_file[0])
         return results
 
 
