@@ -7,7 +7,7 @@ import scipy.stats
 def splithalf(data, rng=None):
     data = np.array(data)
     if rng is None:
-        rng = np.random.RandomState(rng)
+        rng = np.random.RandomState(None)
     inds = range(data.shape[0])
     rng.shuffle(inds)
     half = len(inds) // 2
@@ -27,4 +27,21 @@ def pearsonr_matrix(data1, data2, axis=1):
 
 
 def spearman_brown_correct(pearsonr, n=2):
+    pearsonr = np.array(pearsonr)
     return n * pearsonr / (1 + (n-1) * pearsonr)
+
+
+def resample(data, rng=None):
+    data = np.array(data)
+    if rng is None:
+        rng = np.random.RandomState(None)
+    inds = rng.choice(range(data.shape[0]), size=data.shape[0], replace=True)
+    return data[inds]
+
+
+def bootstrap_resample(data, func=np.mean, niter=100, ci=95, rng=None):
+    df = [func(resample(data, rng=rng)) for i in range(niter)]
+    if ci is not None:
+        return np.percentile(df, 50-ci/2.), np.percentile(df, 50+ci/2.)
+    else:
+        return df

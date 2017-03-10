@@ -1,15 +1,194 @@
 from __future__ import division, print_function, absolute_import
-import sys, subprocess, time, glob, os, inspect, random, string
+import sys, subprocess, time, glob, os, random, string, cPickle, inspect
 
-import dill
 import tqdm
+import dill
 # from joblib import Parallel, delayed
-# from multiprocessing import Pool
+import multiprocessing
+
+import numpy as np
 
 
 class Parallel(object):
 
-    def __init__(self, func, n_jobs=None, n_iter=1, backend='sbatch', timer=False):
+    def __init__(self, func, backend='sbatch', *args, **kwargs):
+        self.func = func
+        self.backend = backend
+
+        if backend == 'sbatch':
+            self.parallel = None
+        elif backend == 'sbatch_pickle':
+            self.parallel = SBatchPickle(*args, **kwargs)
+        elif backend == 'multiprocessing':
+            self.parallel = MultiProcessing(*args, **kwargs)
+        else:
+            raise ValueError('backend "{}" not recognized'.format(backend))
+
+    def __call__(self, *args, **kwargs):
+        if self.backend == 'sbatch':
+            iternos = os.environ['PARALLEL_IDX']
+            iternos = iternos.split('_')
+            iterno = int(iternos[0])
+            if len(iternos) > 1:
+                os.environ['PARALLEL_IDX'] = '_'.join(iternos[1:])
+            return self.func(iterno, *args, **kwargs)
+        else:
+            return self.parallel(*args, **kwargs)
+
+
+class ParallelBase(object):
+
+    @property
+    def pid(self):
+        if not hasattr(self, '_pid'):
+            pid = self.id_generator(n=6)
+            filelist = glob.glob(os.path.join(self._save_path, '*'))
+            while any([pid in os.path.basename(f) for f in filelist]):
+                pid = self.id_generator(m=6)
+            self._pid = pid
+        return self._pid
+
+    def id_generator(self, n=6, chars=string.ascii_lowercase):
+        return ''.join(random.SystemRandom().choice(chars) for _ in range(n))
+
+
+class Run(object):
+
+    def __init__(self, module, func, output_file, timer=False, save_path=None):
+        self.module = os.path.abspath(module)
+        self.func = func
+        self.output_file = output_file
+        self.timer = timer
+        if save_path is None:
+            self._save_path = '/om/user/qbilius/tmp'  # os.getcwd()
+        else:
+            self._save_path = save_path
+
+        template = 'parallel_' + self.pid + '_{}'
+        self.save_path = os.path.join(self._save_path, template)
+
+    def __call__(self, n_iters):
+        python_script_path = self.gen_python_script()
+        self.n_iters = n_iters
+        array = (0, np.prod(self.n_iters))
+        sbatch_path = self.gen_sbatch(python_script_path, array=array)
+        out = subprocess.check_output(['sbatch', sbatch_path])
+
+        out_str = 'Submitted batch job '
+        assert out[:len(out_str)] == out_str
+        job_id = out.split('\n')[0][len(out_str):]
+        self.sbatch_progress(job_id)
+
+        # check if output file was created; if not, there must have been an error
+        for i in range(array[0], array[1]):
+            outf = self.save_path.format('output_{}.pkl'.format(i))
+            if not os.path.isfile(outf):
+                with open(self.save_path.format('slurm_{}.out'.format(i))) as f:
+                    msg = f.read()
+                print()
+                print(msg)
+                sys.exit()
+                # raise Exception('Output file {} not found. See error log above.'.format(outf))
+
+        results = self._combine_results()
+        self._cleanup()
+        cPickle.dump(results, open(self.output_file, 'wb'))
+        return results
+
+    @property
+    def pid(self):
+        if not hasattr(self, '_pid'):
+            pid = self.id_generator(n=6)
+            filelist = glob.glob(os.path.join(self._save_path, '*'))
+            while any([pid in os.path.basename(f) for f in filelist]):
+                pid = self.id_generator(m=6)
+            self._pid = pid
+        return self._pid
+
+    def id_generator(self, n=6, chars=string.ascii_lowercase):
+        return ''.join(random.SystemRandom().choice(chars) for _ in range(n))
+
+    def gen_python_script(self):
+        mod_name = os.path.splitext(os.path.basename(self.module))[0]
+        output_name = self.save_path.format('output_{}.pkl')
+        script = ('import sys, os, imp, cPickle',
+                  'import numpy as np',
+                  'sys.path.insert(0, "{}")',
+                  'mod = imp.load_source("{}", "{}")',
+                  'sh = [int(i) for i in os.environ["PARALLEL_SHAPE"].split("_")]',
+                  'task_id = int(os.environ["SLURM_ARRAY_TASK_ID"])',
+                  'n_iters = np.prod(sh)',
+                  'idx = np.nonzero(np.arange(n_iters).reshape(sh)==task_id)',
+                  'idx = "_".join(str(v[0]) for v in idx)',
+                  'os.environ["PARALLEL_IDX"] = idx',
+                  'res = getattr(mod, "{}")()',
+                  'cPickle.dump(res, open("{}".format(task_id), "wb"))'
+                  )
+        script = '\n'.join(script).format(os.getcwd(), mod_name, self.module, self.func, output_name)
+        script_path = self.save_path.format('script.py')
+        with open(script_path, 'wb') as f:
+            f.write(script)
+        return script_path
+
+    def gen_sbatch(self, callable_path, array=(0,100)):
+        slurm_out_file = self.save_path.format('slurm_%a.out')
+        script = ('#!/bin/bash',
+                  '#SBATCH --array={}-{}',
+                  '#SBATCH --time=7-00:00:00',
+                  '#SBATCH --ntasks=1',
+                  '#SBATCH --output="{}"',
+                  'export PARALLEL_SHAPE={}',
+                  'python "{}" $SLURM_ARRAY_TASK_ID')
+        shape = '_'.join([str(i) for i in self.n_iters])
+        script = '\n'.join(script).format(array[0], array[1] - 1, slurm_out_file,
+                                          shape, callable_path)
+        sbatch_path = self.save_path.format('sbatch.sh')
+        with open(sbatch_path, 'wb') as f:
+            f.write(script)
+        return sbatch_path
+
+    def sbatch_progress(self, job_id):
+        while True:
+            try:
+                jobs = subprocess.check_output('squeue -o %M -j {}'.format(job_id).split())
+            except:
+                print('Squeue error. Trying again in 10 sec...')
+                time.sleep(10)  # queue busy, ask later
+            else:
+                if not jobs.startswith('TIME'):
+                    print('Unexpected squeue output. Trying again in 10 sec...')
+                    time.sleep(10)  # queue busy, ask later
+                elif len(jobs.split('\n')) > 2:  # still running
+                    if self.timer:
+                        t = jobs.split('\n')[-2]
+                        print('\rJob {} (id: {}): {}'.format(job_id, self.pid, t), end='')
+                        sys.stdout.flush()
+                    time.sleep(10)
+                else:
+                    break
+        if self.timer:
+            print()
+
+    def _cleanup(self):
+        for fname in ['sbatch.sh', 'script.py']:
+            os.remove(self.save_path.format(fname))
+        for fname in ['slurm_{}.out', 'output_{}.pkl']:
+            for i in range(np.prod(self.n_iters)):
+                os.remove(self.save_path.format(fname).format(i))
+
+    def _combine_results(self):
+        results = []
+        for i in range(np.prod(self.n_iters)):
+            outf = self.save_path.format('output_{}.pkl'.format(i))
+            res = cPickle.load(open(outf))
+            results.append(res)
+        return results
+
+
+class SBatchPickle(ParallelBase):
+
+    def __init__(self, func, n_jobs=None, n_iter=1, backend='sbatch', timer=False,
+                 save_path=None):
         self.func = func
         if n_jobs is None:
             self.n_jobs = n_iter
@@ -18,40 +197,29 @@ class Parallel(object):
         self.n_iter = n_iter
         self.backend = backend
         self.timer = timer
+        if save_path is None:
+            self._save_path = '/om/user/qbilius/tmp'  # os.getcwd()
+        else:
+            self._save_path = save_path
 
         template = 'parallel_' + self.pid + '_{}'
-        self.save_path = os.path.join(os.getcwd(), template)
+        self.save_path = os.path.join(self._save_path, template)
 
-        frame = inspect.getouterframes(inspect.currentframe())[1][0]
-        self._caller = inspect.getmodule(frame)
-        self._caller_path = os.path.dirname(os.path.abspath(self._caller.__file__))
+        if self.backend == 'sbatch':
+            frames = inspect.getouterframes(inspect.currentframe())
+            self._callers = [inspect.getmodule(frame[0]) for frame in frames[::-1]]
+            self._callers = [c for c in self._callers if c is not None]
+            self._callers = self._callers[-1:]
+            # self._caller = inspect.getmodule(frame)
+            # self._caller_path = os.path.dirname(os.path.abspath(self._caller.__file__))
+            # import pdb; pdb.set_trace()
 
     def __call__(self, *args, **kwargs):
         if self.n_jobs == 1:  # run normally
             res = [self.func(i, *args, **kwargs) for i in tqdm.trange(self.n_iter)]
         else:
-            if self.backend == 'sbatch':
-                res = self._sbatch_run(*args, **kwargs)
-            elif self.backend == 'pickle':
-                res = self._run_from_pickle(*args, **kwargs)
-            else:
-                raise ValueError
+            res = self._sbatch_run(*args, **kwargs)
         return res
-
-    @property
-    def pid(self):
-        if not hasattr(self, '_pid'):
-            if not hasattr(self, 'save_path'):
-                self.save_path = os.getcwd()
-            pid = self.id_generator(n=6)
-            filelist = glob.glob(os.path.join(os.path.dirname(self.save_path), '*'))
-            while any([pid in os.path.basename(f) for f in filelist]):
-                pid = self.id_generator(m=6)
-            self._pid = pid
-        return self._pid
-
-    def id_generator(self, n=6, chars=string.ascii_lowercase):
-        return ''.join(random.SystemRandom().choice(chars) for _ in range(n))
 
     def _func_writer(self, iterno, *args, **kwargs):
         res = self.func(iterno, *args, **kwargs)
@@ -63,7 +231,7 @@ class Parallel(object):
         callable_path = self.save_path.format('script.py')
         script = ('#!/bin/bash\n'
                   '#SBATCH --array={}-{}\n'
-                  '#SBATCH --time=01:00:00\n'
+                  '#SBATCH --time=7-00:00:00\n'
                   '#SBATCH --ntasks=1\n'
                   '#SBATCH --output="{}"\n'
                   'python "{}" $SLURM_ARRAY_TASK_ID'.format(
@@ -74,37 +242,34 @@ class Parallel(object):
 
     def gen_sbatch_python(self, *args, **kwargs):
         tempf = self.save_path.format('vars.pkl')
-        dill.dump([self._caller, self._func_writer, args, kwargs], open(tempf, 'wb'))
-        # add all modules
-        global_vars = ''
-        for global_var in dir(self._caller):
-            if not global_var[:2] == '__' and not global_var[-2:] == '__':  # no built-in
-                global_vars += '    {} = mod.{}\n'.format(global_var, global_var)
+        dill.dump([self._callers, self._func_writer, args, kwargs], open(tempf, 'wb'))
 
         script = ('import sys\n'
                   'def run(iterno):\n'
                   '    import sys, dill\n'
-                  '    sys.path.insert(0, "{}")\n'
-                  '    mod, func, args, kwargs = dill.load(open("{}"))\n{}'
-                  '    func(iterno, *args, **kwargs)\n'
-                  'if __name__ == "__main__":\n'
-                  '    run(int(sys.argv[1]))'.format(self._caller_path, tempf, global_vars)
-                  )
+                  '    sys.path.insert(0, "{}")\n'.format(os.getcwd()))
+
+        # add all modules
+        for caller in self._callers:
+            path = os.path.dirname(os.path.abspath(caller.__file__))
+            script += '    sys.path.insert(0, "{}")\n'.format(path)
+
+        script += '    mods, func, args, kwargs = dill.load(open("{}"))\n'.format(tempf)
+        for i, caller in enumerate(self._callers):
+            for global_var in dir(caller):
+                if not global_var[:2] == '__' and not global_var[-2:] == '__':  # no built-in
+                    script += '    {} = mods[{}].{}\n'.format(global_var, i, global_var)
+
+        script += ('    func(iterno, *args, **kwargs)\n'
+                   'if __name__ == "__main__":\n'
+                   '    run(int(sys.argv[1]))')
+
         with open(self.save_path.format('script.py'), 'wb') as f:
             f.write(script)
 
-    def _run_from_pickle(self, *args, **kwargs):
-        self.gen_sbatch_python(*args, **kwargs)
-        for i in range(self.n_iter):
-            subprocess.check_call('python {} {}'.format(sbatch_python.name, i).split())
-        os.remove(func_pkl.name)
-        os.remove(sbatch_python.name)
-        p = os.path.basename(sbatch_python.name).split('.')[0]
-        return self._combine_results('parallel_output_{}_*_{}.pkl'.format(p))
-
     def _sbatch_run(self, *args, **kwargs):
         self.gen_sbatch_python(*args, **kwargs)
-        for batch_no in range((self.n_jobs - 1) // self.n_iter + 1):
+        for batch_no in range((self.n_iter - 1) // self.n_jobs + 1):
             array = (batch_no * self.n_jobs, (batch_no+1) * self.n_jobs)
             self.gen_sbatch_array(array=array)
 
@@ -114,15 +279,23 @@ class Parallel(object):
             assert out[:len(out_str)] == out_str
             job_id = out.split('\n')[0][len(out_str):]
             while True:
-                jobs = subprocess.check_output('squeue -o %M -j {}'.format(job_id).split())
-                if len(jobs.split('\n')) > 2:  # still running
-                    if self.timer:
-                        t = jobs.split('\n')[-2]
-                        print('\rJob {}: {}'.format(job_id, t), end='')
-                        sys.stdout.flush()
-                    time.sleep(1)
+                try:
+                    jobs = subprocess.check_output('squeue -o %M -j {}'.format(job_id).split())
+                except:
+                    print('Squeue error. Trying again in 10 sec...')
+                    time.sleep(10)  # queue busy, ask later
                 else:
-                    break
+                    if not jobs.startswith('TIME'):
+                        print('Unexpected squeue output. Trying again in 10 sec...')
+                        time.sleep(10)  # queue busy, ask later
+                    elif len(jobs.split('\n')) > 2:  # still running
+                        if self.timer:
+                            t = jobs.split('\n')[-2]
+                            print('\rJob {}: {}'.format(job_id, t), end='')
+                            sys.stdout.flush()
+                        time.sleep(10)
+                    else:
+                        break
 
             # check if output file was created; if not, there must have been an error
             for i in range(array[0], array[1]):
@@ -153,11 +326,51 @@ class Parallel(object):
         return results
 
 
-# def parallel(n_jobs=-1, n_parallel=10):
-#     def _parallel(func):
-#         def func_wrapper(*args, **kwargs):
-#             p = Parallel(n_jobs=n_jobs)
-#             import pdb; pdb.set_trace()
-#             return p(delayed(func)(*args, **kwargs) for i in range(n_parallel))
-#         return func_wrapper
-#     return _parallel
+class MultiProcessing(ParallelBase):
+
+    def __init__(self, func, n_jobs=None, n_iter=1, backend='sbatch', timer=False,
+                 save_path=None):
+        self.func = func
+        if n_jobs is None:
+            self.n_jobs = n_iter
+        else:
+            self.n_jobs = min(n_jobs, n_iter)
+        self.n_iter = n_iter
+        self.backend = backend
+        self.timer = timer
+        if save_path is None:
+            self._save_path = '/om/user/qbilius/tmp'  # os.getcwd()
+        else:
+            self._save_path = save_path
+
+        template = 'parallel_' + self.pid + '_{}'
+        self.save_path = os.path.join(self._save_path, template)
+
+    def __call__(self, *args, **kwargs):
+        if self.n_jobs == 1:  # run normally
+            res = [self.func(i, *args, **kwargs) for i in tqdm.trange(self.n_iter)]
+        else:
+            res = self._sbatch_run(*args, **kwargs)
+        return res
+
+    def _multiproc_run(self, *args, **kwargs):
+        results = []
+        for batch_no in tqdm.trange((self.n_iter - 1) // self.n_jobs + 1):
+            pool = multiprocessing.Pool(processes=self.n_jobs)
+            array = range(batch_no * self.n_jobs, (batch_no+1) * self.n_jobs)
+            func_args = ([self.func, i, args, kwargs] for i in array)
+            out = pool.map(func_star, func_args)
+            pool.close()
+            pool.join()
+            results.extend(out)
+        return results
+
+
+def func_star((func, iterno, args, kwargs)):
+        return func(iterno, *args, **kwargs)
+
+
+if __name__ == '__main__':
+    Run('exps/hvm_caveats.py', 'generalization',
+        '/mindhive/dicarlolab/u/qbilius/computed/generalization.pkl', timer=True)([10,10])
+    # Run('exps/parallel_test_main.py', 'run', timer=True)([10])
