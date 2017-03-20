@@ -5,6 +5,8 @@ import pandas
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.cross_decomposition import PLSRegression
 import scipy.stats
+import tensorflow as tf
+import tqdm
 
 from streams.envs import hvm
 from streams import utils
@@ -106,6 +108,71 @@ class NeuralFit(object):
         r = utils.pearsonr_matrix(split1, split2)
         rc = utils.spearman_brown_correct(r, n=2)
         return rc
+
+
+class HvM6IT_QuickNeural(object):
+
+    def __init__(self, path, resize=224, batch_size=256, **kwargs):
+        """
+        tfutils compatible HvM reader
+        """
+        self.resize = resize
+        self.batch_size = batch_size
+        self.data = np.load(path)
+        self._idx = 0
+
+    def init_ops(self):
+        sel = slice(self._idx, self._idx + self.batch_size)
+        ims = self.data['images'][sel]
+        batch = {'images': tf.image.resize_images(ims, [self.resize, self.resize]),
+                 'labels': tf.constant(self.data['labels'][sel])}
+        self._idx += self.batch_size
+        return [batch]
+
+    def get_target(self, inputs, outputs, target='fc6',
+                   tensor_name='validation/hvm_neural_fit/fc6/fc/fc:0'):
+        return {target: tf.get_default_graph().get_tensor_by_name(tensor_name)}
+
+    def agg_func(self, output):
+        perm = np.random.RandomState(0).permutation(output[0]['fc6'].shape[1])[:1024]
+        model_feats = np.row_stack(it['fc6'] for it in output)[:, perm]
+        explained_var = self.neural_fit(model_feats)
+        return explained_var
+
+    def neural_fit(self, model_feats):
+        rng = np.random.RandomState(0)
+        neural_feats_reps = self.data['neural']
+        labels = self.data['labels']
+        # np.repeat(range(64), 40)
+        explained_var = []
+        sss = StratifiedShuffleSplit(n_splits=10, test_size=.25, random_state=rng)
+        for train_inds, test_inds in tqdm.tqdm(sss.split(model_feats, labels), desc='hvm regression', total=sss.n_splits):
+            neural_feats = neural_feats_reps.mean(axis=0)
+            pls = PLSRegression(n_components=25, scale=False)
+            pls.fit(model_feats[train_inds], neural_feats[train_inds])
+            pred = pls.predict(model_feats[test_inds])
+            actual = neural_feats[test_inds]
+            raw_fit = utils.pearsonr_matrix(actual, pred)
+
+            # mapping cons
+            pls = PLSRegression(n_components=25, scale=False)
+            split1, split2 = utils.splithalf(neural_feats_reps[:, train_inds], rng=rng)
+            pls.fit(model_feats[train_inds], split1)
+            pred1 = pls.predict(model_feats[test_inds])
+            pls.fit(model_feats[train_inds], split2)
+            pred2 = pls.predict(model_feats[test_inds])
+            r = utils.pearsonr_matrix(pred1, pred2)
+            mc_rc = utils.spearman_brown_correct(r, n=2)
+
+            # internal cons
+            split1, split2 = utils.splithalf(neural_feats_reps[:, test_inds], rng=rng)
+            r = utils.pearsonr_matrix(split1, split2)
+            ic_rc = utils.spearman_brown_correct(r, n=2)
+
+            ev = (raw_fit / np.sqrt(mc_rc * ic_rc)) ** 2
+            # import pdb; pdb.set_trace()
+            explained_var.append(ev.mean())
+        return {'explained_var': np.mean(explained_var)}
 
 
 def _ttest_mean(data, alpha=.05):
