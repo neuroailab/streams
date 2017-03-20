@@ -2,6 +2,8 @@ from __future__ import division, print_function, absolute_import
 
 import numpy as np
 import scipy.stats
+import pandas
+import seaborn as sns
 
 
 def splithalf(data, rng=None):
@@ -45,3 +47,33 @@ def bootstrap_resample(data, func=np.mean, niter=100, ci=95, rng=None):
         return np.percentile(df, 50-ci/2.), np.percentile(df, 50+ci/2.)
     else:
         return df
+
+
+def _timeplot_bootstrap(x, estimator=np.mean, ci=95, n_boot=100):
+    ci = bootstrap_resample(x, func=estimator, ci=ci, niter=n_boot)
+    return pandas.Series({'emin': ci[0], 'emax': ci[1]})
+
+
+def timeplot(data=None, x=None, y=None, hue=None,
+             estimator=np.mean, ci=95, n_boot=100, **kwargs):
+    if hue is None:
+        hues = ['']
+    else:
+        hues = data[hue].unique()
+
+    for h, color in zip(hues, sns.color_palette()):
+        if hue is None:
+            d = data
+        else:
+            d = data[data[hue] == h]
+
+        mn = d.groupby(x)[y].apply(estimator)
+        ebars = d.groupby(x)[y].apply(lambda x: _timeplot_bootstrap(x, estimator, ci, n_boot)).unstack()
+
+        sns.plt.fill_between(mn.index, ebars.emin, ebars.emax, alpha=.5, color=color)
+        sns.plt.plot(mn.index, mn, linewidth=2, color=color, label=h, **kwargs)
+        sns.plt.xlabel(x)
+        sns.plt.ylabel(y)
+
+    if hue is not None:
+        sns.plt.legend()
