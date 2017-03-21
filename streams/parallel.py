@@ -11,12 +11,15 @@ import numpy as np
 
 class Parallel(object):
 
-    def __init__(self, func, backend='sbatch', *args, **kwargs):
+    def __init__(self, func, n_iter, backend=None, *args, **kwargs):
         self.func = func
+        self.n_iter = n_iter
         self.backend = backend
 
-        if backend == 'sbatch':
-            self.parallel = None
+        if backend is None:
+            self.parallel = 'loop'
+        elif backend == 'sbatch':
+            self.parallel = 'sbatch'
         elif backend == 'sbatch_pickle':
             self.parallel = SBatchPickle(*args, **kwargs)
         elif backend == 'multiprocessing':
@@ -25,13 +28,17 @@ class Parallel(object):
             raise ValueError('backend "{}" not recognized'.format(backend))
 
     def __call__(self, *args, **kwargs):
-        if self.backend == 'sbatch':
+        if self.backend is None:  # normal loop
+            return [self.func(iterno, *args, **kwargs) for iterno in range(self.n_iter)]
+
+        elif self.backend == 'sbatch':
             iternos = os.environ['PARALLEL_IDX']
             iternos = iternos.split('_')
             iterno = int(iternos[0])
             if len(iternos) > 1:
                 os.environ['PARALLEL_IDX'] = '_'.join(iternos[1:])
             return self.func(iterno, *args, **kwargs)
+
         else:
             return self.parallel(*args, **kwargs)
 

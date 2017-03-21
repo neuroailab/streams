@@ -3,23 +3,24 @@ from __future__ import division, print_function, absolute_import
 import numpy as np
 import pandas
 from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.linear_model import OrthogonalMatchingPursuit
 from sklearn.cross_decomposition import PLSRegression
 import scipy.stats
-import tensorflow as tf
 import tqdm
 
 from streams.envs import hvm
 from streams import utils
-from streams.parallel_new import Parallel
+from streams.parallel import Parallel
 
 
 class NeuralFit(object):
 
-    def __init__(self, model_feats, neural_feats_reps, labels=None,
+    def __init__(self, model_feats, neural_feats_reps, labels,
+                 regression=OrthogonalMatchingPursuit(),
                  n_splits=10, test_size=1/4., n_splithalves=10,
-                 n_components=25, scale=False, timer=False):
+                 **parallel_kwargs):
         """
-        PLSRegression-based fitting of model features to neurons.
+        Regression of model features to neurons.
 
         :Args:
             - model_feats
@@ -32,10 +33,6 @@ class NeuralFit(object):
                 Number of splits into (train, test)
             - n_splithalves
                 Number of splits over reps
-            - n_components
-                Number of components for PLSRegression
-            - scale
-                Whether to scale features in PLSRegression
 
         :Returns:
             The fit outcome (pandas.DataFrame)
@@ -43,11 +40,10 @@ class NeuralFit(object):
         self.model_feats = model_feats
         self.neural_feats_reps = neural_feats_reps
         self.labels = labels
+        self.reg = regression
         self.n_splits = n_splits
         self.n_splithalves = n_splithalves
-        self.n_components = n_components
-        self.scale = scale
-        self.timer = timer
+        self.pkwargs = parallel_kwargs
 
         self.rng = np.random.RandomState(0)
         sss = StratifiedShuffleSplit(n_splits=self.n_splits,
@@ -55,27 +51,29 @@ class NeuralFit(object):
         self.splits = [s for s in sss.split(self.model_feats, self.labels)]
 
     def fit(self):
-        df = Parallel(self._fit, n_iter=self.n_splits, timer=self.timer)()
-        # df = pandas.concat(df, axis=0, ignore_index=True)
+        df = Parallel(self._fit, n_iter=self.n_splits, **self.pkwargs)()
+        df = pandas.concat(df, axis=0, ignore_index=True)
         return df
 
     def _fit(self, splitno):
         train_inds, test_inds = self.splits[splitno]
         r = self.raw_fit(train_inds, test_inds)
-        res = Parallel(self._cons, n_iter=self.n_splithalves)(r, train_inds, test_inds)
-        # res = pandas.concat(res, axis=0, ignore_index=True)
+        res = Parallel(self._cons, n_iter=self.n_splithalves, **self.pkwargs)(r, train_inds, test_inds)
+        res = pandas.concat(res, axis=0, ignore_index=True)
         res['split'] = splitno
         res['explained_var'] = res.fit_r ** 2 / (res.internal_cons * res.mapping_cons)
         return res
 
     def raw_fit(self, train_inds, test_inds):
         neural_feats = self.neural_feats_reps.mean(axis=0)
-        pls = PLSRegression(n_components=self.n_components, scale=self.scale)
-        pls.fit(self.model_feats[train_inds], neural_feats[train_inds])
-        pred = pls.predict(self.model_feats[test_inds])
-        actual = neural_feats[test_inds]
-        r = utils.pearsonr_matrix(actual, pred)
-        return r
+        rs = []
+        for site in range(self.neural_feats_reps.shape[-1]):
+            self.reg.fit(self.model_feats[train_inds], np.squeeze(neural_feats[train_inds, site]))
+            pred = np.squeeze(self.reg.predict(self.model_feats[test_inds]))
+            actual = neural_feats[test_inds, site]
+            r = scipy.stats.pearsonr(actual, pred)[0]
+            rs.append(r)
+        return np.squeeze(rs)
 
     def _cons(self, splithalfno, r, train_inds, test_inds):
         mapping_cons = self.mapping_cons(splithalfno, train_inds, test_inds)
@@ -91,16 +89,17 @@ class NeuralFit(object):
         Split data in half over reps, run PLS on each half on the train set,
         get predictions for the test set, correlate the two, Spearman-Brown
         """
-        pls = PLSRegression(n_components=self.n_components, scale=self.scale)
+        rs = []
         rng = np.random.RandomState(splithalfno)
-        split1, split2 = utils.splithalf(self.neural_feats_reps[:, train_inds], rng=rng)
-        pls.fit(self.model_feats[train_inds], split1)
-        pred1 = pls.predict(self.model_feats[test_inds])
-        pls.fit(self.model_feats[train_inds], split2)
-        pred2 = pls.predict(self.model_feats[test_inds])
-        r = utils.pearsonr_matrix(pred1, pred2)
-        rc = utils.spearman_brown_correct(r, n=2)
-        return rc
+        for site in range(self.neural_feats_reps.shape[-1]):
+            split1, split2 = utils.splithalf(self.neural_feats_reps[:, train_inds, site], rng=rng)
+            self.reg.fit(self.model_feats[train_inds], split1)
+            pred1 = self.reg.predict(self.model_feats[test_inds])
+            self.reg.fit(self.model_feats[train_inds], split2)
+            pred2 = self.reg.predict(self.model_feats[test_inds])
+            r = scipy.stats.pearsonr(pred1, pred2)[0]
+            rs.append(r)
+        return np.squeeze(utils.spearman_brown_correct(rs, n=2))
 
     def internal_cons(self, splithalfno, test_inds):
         rng = np.random.RandomState(splithalfno)
@@ -110,69 +109,7 @@ class NeuralFit(object):
         return rc
 
 
-class HvM6IT_QuickNeural(object):
 
-    def __init__(self, path, resize=224, batch_size=256, **kwargs):
-        """
-        tfutils compatible HvM reader
-        """
-        self.resize = resize
-        self.batch_size = batch_size
-        self.data = np.load(path)
-        self._idx = 0
-
-    def init_ops(self):
-        sel = slice(self._idx, self._idx + self.batch_size)
-        ims = self.data['images'][sel]
-        batch = {'images': tf.image.resize_images(ims, [self.resize, self.resize]),
-                 'labels': tf.constant(self.data['labels'][sel])}
-        self._idx += self.batch_size
-        return [batch]
-
-    def get_target(self, inputs, outputs, target='fc6',
-                   tensor_name='validation/hvm_neural_fit/fc6/fc/fc:0'):
-        return {target: tf.get_default_graph().get_tensor_by_name(tensor_name)}
-
-    def agg_func(self, output):
-        perm = np.random.RandomState(0).permutation(output[0]['fc6'].shape[1])[:1024]
-        model_feats = np.row_stack(it['fc6'] for it in output)[:, perm]
-        explained_var = self.neural_fit(model_feats)
-        return explained_var
-
-    def neural_fit(self, model_feats):
-        rng = np.random.RandomState(0)
-        neural_feats_reps = self.data['neural']
-        labels = self.data['labels']
-        # np.repeat(range(64), 40)
-        explained_var = []
-        sss = StratifiedShuffleSplit(n_splits=10, test_size=.25, random_state=rng)
-        for train_inds, test_inds in tqdm.tqdm(sss.split(model_feats, labels), desc='hvm regression', total=sss.n_splits):
-            neural_feats = neural_feats_reps.mean(axis=0)
-            pls = PLSRegression(n_components=25, scale=False)
-            pls.fit(model_feats[train_inds], neural_feats[train_inds])
-            pred = pls.predict(model_feats[test_inds])
-            actual = neural_feats[test_inds]
-            raw_fit = utils.pearsonr_matrix(actual, pred)
-
-            # mapping cons
-            pls = PLSRegression(n_components=25, scale=False)
-            split1, split2 = utils.splithalf(neural_feats_reps[:, train_inds], rng=rng)
-            pls.fit(model_feats[train_inds], split1)
-            pred1 = pls.predict(model_feats[test_inds])
-            pls.fit(model_feats[train_inds], split2)
-            pred2 = pls.predict(model_feats[test_inds])
-            r = utils.pearsonr_matrix(pred1, pred2)
-            mc_rc = utils.spearman_brown_correct(r, n=2)
-
-            # internal cons
-            split1, split2 = utils.splithalf(neural_feats_reps[:, test_inds], rng=rng)
-            r = utils.pearsonr_matrix(split1, split2)
-            ic_rc = utils.spearman_brown_correct(r, n=2)
-
-            ev = (raw_fit / np.sqrt(mc_rc * ic_rc)) ** 2
-            # import pdb; pdb.set_trace()
-            explained_var.append(ev.mean())
-        return {'explained_var': np.mean(explained_var)}
 
 
 def _ttest_mean(data, alpha=.05):
