@@ -11,10 +11,11 @@ import numpy as np
 
 class Parallel(object):
 
-    def __init__(self, func, n_iter, backend=None, *args, **kwargs):
+    def __init__(self, func, n_iter, backend=None, timer=False, *args, **kwargs):
         self.func = func
         self.n_iter = n_iter
         self.backend = backend
+        self.timer = timer
 
         if backend is None:
             self.parallel = 'loop'
@@ -29,7 +30,7 @@ class Parallel(object):
 
     def __call__(self, *args, **kwargs):
         if self.backend is None:  # normal loop
-            return [self.func(iterno, *args, **kwargs) for iterno in range(self.n_iter)]
+            return [self.func(iterno, *args, **kwargs) for iterno in tqdm.trange(self.n_iter, disable=self.timer)]
 
         elif self.backend == 'sbatch':
             iternos = os.environ['PARALLEL_IDX']
@@ -143,6 +144,7 @@ class Run(object):
                   '#SBATCH --array={}-{}',
                   '#SBATCH --time=7-00:00:00',
                   '#SBATCH --ntasks=1',
+                  '#SBATCH --cpus-per-task=16',
                   '#SBATCH --output="{}"',
                   'export PARALLEL_SHAPE={}',
                   'python "{}" $SLURM_ARRAY_TASK_ID')
@@ -378,6 +380,6 @@ def func_star((func, iterno, args, kwargs)):
 
 
 if __name__ == '__main__':
-    Run('exps/hvm_caveats.py', 'generalization',
-        '/mindhive/dicarlolab/u/qbilius/computed/generalization.pkl', timer=True)([10,10])
+    Run('exps/hvm_caveats.py', 'compare_regressions_cv',
+        '/mindhive/dicarlolab/u/qbilius/computed/reg_cv_test.pkl', timer=True)([1,1])
     # Run('exps/parallel_test_main.py', 'run', timer=True)([10])
