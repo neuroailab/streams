@@ -163,8 +163,9 @@ class HvM6Neural(Dataset):
                          'a95c797b0b2eef56d431c8ccca4c160143a65357', None),
             'temporal': ('Chabo_Tito_20140307_Var06a_pooled_P58.trim.wh.evoked.repr.h5',
                          '8ed6ec266fd0104368121aa742038f04681f7231', None),
-            'temporal_raw': 'Chabo_Tito_20140307_Var06a_pooled_P58.trim.raw.d.repr.h5',
-            'temporal_evoked': 'Chabo_Tito_20140307_Var06a_pooled_P58.trim.evoked.repr.h5'}
+            # 'temporal_raw': 'Chabo_Tito_20140307_Var06a_pooled_P58.trim.raw.d.repr.h5',
+            # 'temporal_evoked': 'Chabo_Tito_20140307_Var06a_pooled_P58.trim.evoked.repr.h5'
+            }
 
 
     IT_NEURONS = range(0, 11) + range(45, 85) + range(121, 163) + range(171, 211) + range(221, 256)
@@ -187,7 +188,7 @@ class HvM6Neural(Dataset):
         if timepoint is None:
             path = self.datapath('averaged')
         else:
-            path = self.datapath('temporal_raw')
+            path = self.datapath('temporal')
         f = tables.open_file(path)
         if timepoint is None:
             nd = f.root.spk[0]  # shape is (1, reps, ...)
