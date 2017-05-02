@@ -30,7 +30,7 @@ class Parallel(object):
 
     def __call__(self, *args, **kwargs):
         if self.backend is None:  # normal loop
-            return [self.func(iterno, *args, **kwargs) for iterno in tqdm.trange(self.n_iter, disable=self.timer)]
+            return [self.func(iterno, *args, **kwargs) for iterno in tqdm.trange(self.n_iter, disable=not self.timer)]
 
         elif self.backend == 'sbatch':
             iternos = os.environ['PARALLEL_IDX']
