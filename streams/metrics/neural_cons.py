@@ -2,12 +2,14 @@ from __future__ import division, print_function, absolute_import
 
 import numpy as np
 import pandas
+import scipy.stats
+import tqdm
+
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn import linear_model
 from sklearn.linear_model import OrthogonalMatchingPursuit
 from sklearn.cross_decomposition import PLSRegression
-import scipy.stats
-import tqdm
+from sklearn.decomposition import PCA
 
 from streams.envs import hvm
 from streams import utils
@@ -18,7 +20,7 @@ class NeuralFit(object):
 
     def __init__(self, model_feats, neural_feats_reps, labels,
                  regression=OrthogonalMatchingPursuit(),
-                 n_splits=10, test_size=1/4., n_splithalves=10,
+                 n_splits=10, test_size=1/4., n_splithalves=10, pca=False,
                  **parallel_kwargs):
         """
         Regression of model features to neurons.
@@ -39,11 +41,12 @@ class NeuralFit(object):
             The fit outcome (pandas.DataFrame)
         """
         self.model_feats = model_feats
-        self.neural_feats_reps = neural_feats_reps
+        self._neural_feats_reps = neural_feats_reps
         self.labels = labels
         self.reg = regression
         self.n_splits = n_splits
         self.n_splithalves = n_splithalves
+        self.do_pca = pca
         self.pkwargs = parallel_kwargs
 
         self.rng = np.random.RandomState(0)
@@ -51,13 +54,29 @@ class NeuralFit(object):
                                      test_size=test_size, random_state=self.rng)
         self.splits = [s for s in sss.split(self.model_feats, self.labels)]
 
+    def pca(self, train_inds, test_inds):
+        pca = PCA()
+        neural_feats = self._neural_feats_reps.mean(axis=0)
+        out = np.zeros_like(self._neural_feats_reps)
+
+        pca.fit(neural_feats[train_inds])
+        out[:, train_inds] = [pca.transform(r) for r in self._neural_feats_reps[:, train_inds]]
+        out[:, test_inds] = [pca.transform(r) for r in self._neural_feats_reps[:, test_inds]]
+        return out
+
     def fit(self):
         df = Parallel(self._fit, n_iter=self.n_splits, **self.pkwargs)()
         df = pandas.concat(df, axis=0, ignore_index=True)
+        if self.do_pca:
+            df.rename(columns={'site': 'pc'}, inplace=True)
         return df
 
     def _fit(self, splitno):
         train_inds, test_inds = self.splits[splitno]
+        if self.do_pca:
+            self.neural_feats_reps = self.pca(train_inds, test_inds)
+        else:
+            self.neural_feats_reps = self._neural_feats_reps
         r = self.raw_fit(train_inds, test_inds)
         res = Parallel(self._cons, n_iter=self.n_splithalves, **self.pkwargs)(r, train_inds, test_inds)
         res = pandas.concat(res, axis=0, ignore_index=True)
