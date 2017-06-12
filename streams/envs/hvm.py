@@ -7,7 +7,7 @@ import pandas
 import tables
 import boto3
 import tqdm
-
+import skimage, skimage.io, skimage.transform
 
 DATA_HOME = os.path.abspath(os.path.expanduser(os.environ.get(
                 'STREAMS_ROOT', os.path.join('~', '.streams'))))
@@ -52,8 +52,9 @@ class Dataset(object):
         data = self.DATA[handle]
         if isinstance(data, tuple):
             s3_path, sha1, local_path = data
-            if local_path is None:
-                local_path = s3_path.replace(self.COLL + '/' + self.name + '/', '', 1)
+            local_path = os.path.join(local_path, s3_path)
+            # if local_path is None:
+            #     local_path = s3_path.replace(self.COLL + '/' + self.name + '/', '', 1)
         else:
             local_path = data.replace(self.COLL + '/' + self.name + '/', '', 1)
         if prefix is not None:
@@ -140,6 +141,7 @@ class HvM(Dataset):
 
     DATA = {'meta': 'streams/hvm/meta.pkl',
 
+            'imageset/discfade': ('diskfade_150x150.png', '0f4f617c24a58bc039d3ed5ff86cad829d2245ca', 'imageset'),
             'imageset/tfrecords/var0': 'streams/hvm/imageset/tfrecords/var0.tfrecords',
             'imageset/tfrecords/var3': 'streams/hvm/imageset/tfrecords/var3.tfrecords',
             'imageset/tfrecords/var6': 'streams/hvm/imageset/tfrecords/var6.tfrecords',
@@ -148,18 +150,18 @@ class HvM(Dataset):
             # 'meta': ('streams/hvm/imageset/meta.pkl', None, 'hvm/imageset/meta.pkl'),
 
             'neural/averaged/var0': ('Chabo_Tito_20110907_Var00a_pooled_P58.trim.wh.evoked.repr.h5',
-                              '300b4446797b6244987f3d98b38c4cb36f61086d', None),
+                              '300b4446797b6244987f3d98b38c4cb36f61086d', 'neural'),
             'neural/averaged/var3': ('Chabo_Tito_20110907_Var03a_pooled_P58.trim.wh.evoked.repr.h5',
-                              'd72802384c35915ceee80a530e1d1053b086975a', None),
+                              'd72802384c35915ceee80a530e1d1053b086975a', 'neural'),
             'neural/averaged/var6': ('Chabo_Tito_20110907_Var06a_pooled_P58.trim.wh.evoked.repr.h5',
-                              'a95c797b0b2eef56d431c8ccca4c160143a65357', None),
+                              'a95c797b0b2eef56d431c8ccca4c160143a65357', 'neural'),
 
             'neural/temporal/var0': ('Chabo_Tito_20140307_Var00a_pooled_P58.trim.wh.evoked.repr.h5',
-                              '588d6d118a45e98c65260e9226c237c72244af0d', None),
+                              '588d6d118a45e98c65260e9226c237c72244af0d', 'neural'),
             'neural/temporal/var3': ('Chabo_Tito_20140307_Var03a_pooled_P58.trim.wh.evoked.repr.h5',
-                              '52a35255b1595c29be747c5725be7d6f0e6bd037', None),
+                              '52a35255b1595c29be747c5725be7d6f0e6bd037', 'neural'),
             'neural/temporal/var6': ('Chabo_Tito_20140307_Var06a_pooled_P58.trim.wh.evoked.repr.h5',
-                              '8ed6ec266fd0104368121aa742038f04681f7231', None),
+                              '8ed6ec266fd0104368121aa742038f04681f7231', 'neural'),
             # 'temporal_raw': 'Chabo_Tito_20140307_Var06a_pooled_P58.trim.raw.d.repr.h5',
             # 'temporal_evoked': 'Chabo_Tito_20140307_Var06a_pooled_P58.trim.evoked.repr.h5'
 
@@ -202,14 +204,33 @@ class HvM(Dataset):
                 self._meta = self._meta[self._meta['var'] == self.var]
         return self._meta
 
+    @property
+    def images(self):
+        if not hasattr(self, '_images'):
+            ims = []
+            for idd in self.meta.id.values:
+                im = skimage.io.imread(self.home('imageset/images', idd + '.png'))
+                im = skimage.img_as_float(im)
+                ims.append(im)
+            self._images = np.array(ims)
+        return self._images
+
+    @property
+    def discfade(self):
+        if not hasattr(self, '_discfade'):
+            mask = 255 - skimage.io.imread(self.datapath('imageset/discfade'))[:,:,3]
+            mask = np.dstack([mask,mask,mask])
+            self._discfade = skimage.transform.resize(mask, [256,256])
+        return self._discfade
+
     def neural(self, timepoint=None):
         """
         Format: (time bins, reps, images, sites)
         """
         if timepoint is None:
-            path = self.datapath('neural/averaged/var{}'.format(self.var), 'neural')
+            path = self.datapath('neural/averaged/var{}'.format(self.var))
         else:
-            path = self.datapath('neural/temporal/var{}'.format(self.var), 'neural')
+            path = self.datapath('neural/temporal/var{}'.format(self.var))
         f = tables.open_file(path)
         if timepoint is None:
             nd = f.root.spk[0]  # shape is (1, reps, ...)
