@@ -20,7 +20,8 @@ class NeuralFit(object):
 
     def __init__(self, model_feats, neural_feats_reps, labels,
                  regression=OrthogonalMatchingPursuit(),
-                 n_splits=10, test_size=1/4., n_splithalves=10, pca=False,
+                 n_splits=10, test_size=1/4., n_splithalves=10,
+                 pca=False, n_components=1024,
                  **parallel_kwargs):
         """
         Regression of model features to neurons.
@@ -46,7 +47,9 @@ class NeuralFit(object):
         self.reg = regression
         self.n_splits = n_splits
         self.n_splithalves = n_splithalves
-        self.do_pca = pca
+        self.do_pca = bool(pca)
+        self._pca = pca
+        self.n_components = n_components
         self.pkwargs = parallel_kwargs
 
         self.rng = np.random.RandomState(0)
@@ -55,7 +58,10 @@ class NeuralFit(object):
         self.splits = [s for s in sss.split(self.model_feats, self.labels)]
 
     def pca(self, train_inds, test_inds):
-        pca = PCA()
+        if isinstance(self._pca, PCA):
+            pca = self._pca
+        else:
+            pca = PCA(n_components=self.n_components)
         neural_feats = self._neural_feats_reps.mean(axis=0)
         out = np.zeros_like(self._neural_feats_reps)
 
