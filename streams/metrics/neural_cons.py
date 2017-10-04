@@ -16,12 +16,39 @@ from streams import utils
 from streams.parallel import Parallel
 
 
+def nfit(model_feats, neural, labels, n_splits=10, n_components=200, test_size=.25):
+    if model_feats.shape[1] > n_components:
+        model_feats = PCA(n_components=n_components).fit_transform(model_feats)
+    skf = StratifiedShuffleSplit(n_splits=n_splits, test_size=test_size)
+    df = []
+    for it, (train_idx, test_idx) in enumerate(skf.split(model_feats, labels)):
+        reg = PLSRegression(n_components=25, scale=False)
+        reg.fit(model_feats[train_idx], neural[train_idx])
+        pred = reg.predict(model_feats[test_idx])
+        rs = utils.pearsonr_matrix(neural[test_idx], pred)
+        df.extend([(it, site, r) for site, r in enumerate(rs)])
+    df = pandas.DataFrame(df, columns=['split', 'site', 'fit_r'])
+    return df
+
+
+def internal_cons(data, niter=10, seed=None):
+    rng = np.random.RandomState(seed)
+    df = []
+    for i in range(niter):
+        split1, split2 = utils.splithalf(data, rng=rng)
+        r = utils.pearsonr_matrix(split1, split2)
+        rc = utils.spearman_brown_correct(r, n=2)
+        df.extend([(i, site, rci) for site, rci in enumerate(rc)])
+    df = pandas.DataFrame(df, columns=['splithalf', 'site', 'internal_cons'])
+    return df
+
+
 class NeuralFit(object):
 
     def __init__(self, model_feats, neural_feats_reps, labels,
                  regression=OrthogonalMatchingPursuit(),
                  n_splits=10, test_size=1/4., n_splithalves=10,
-                 pca=False, n_components=1024,
+                 pca=False, n_components=None,
                  **parallel_kwargs):
         """
         Regression of model features to neurons.
@@ -62,9 +89,8 @@ class NeuralFit(object):
             pca = self._pca
         else:
             pca = PCA(n_components=self.n_components)
-        neural_feats = self._neural_feats_reps.mean(axis=0)
+        neural_feats = np.nanmean(self._neural_feats_reps, axis=0)
         out = np.zeros_like(self._neural_feats_reps)
-
         pca.fit(neural_feats[train_inds])
         out[:, train_inds] = [pca.transform(r) for r in self._neural_feats_reps[:, train_inds]]
         out[:, test_inds] = [pca.transform(r) for r in self._neural_feats_reps[:, test_inds]]
@@ -91,7 +117,7 @@ class NeuralFit(object):
         return res
 
     def raw_fit(self, train_inds, test_inds):
-        neural_feats = self.neural_feats_reps.mean(axis=0)
+        neural_feats = np.nanmean(self.neural_feats_reps, axis=0)
         rs = []
         for site in range(self.neural_feats_reps.shape[-1]):
             self.reg.fit(self.model_feats[train_inds], np.squeeze(neural_feats[train_inds, site]))
@@ -144,7 +170,7 @@ class NeuralFitAllSites(NeuralFit):
                 labels, regression=regression, **kwargs)
 
     def raw_fit(self, train_inds, test_inds):
-        neural_feats = self.neural_feats_reps.mean(axis=0)
+        neural_feats = np.nanmean(self.neural_feats_reps, axis=0)
         self.reg.fit(self.model_feats[train_inds], np.squeeze(neural_feats[train_inds]))
         pred = np.squeeze(self.reg.predict(self.model_feats[test_inds]))
         actual = neural_feats[test_inds]
@@ -233,7 +259,7 @@ class NeuralFitCV(object):
         return res
 
     def raw_fit(self, train_inds, test_inds):
-        neural_feats = self.neural_feats_reps.mean(axis=0)
+        neural_feats = np.nanmean(self.neural_feats_reps, axis=0)
         rs = []
         reg_params = []
         for site in range(self.neural_feats_reps.shape[-1]):
