@@ -1,5 +1,5 @@
 from __future__ import division, print_function, absolute_import
-import sys, subprocess, time, glob, os, random, string, cPickle, inspect
+import sys, subprocess, time, glob, os, random, string, pickle, inspect, argparse
 
 import tqdm
 import dill
@@ -7,6 +7,8 @@ import dill
 import multiprocessing
 
 import numpy as np
+
+COMPUTED = os.environ.get('COMPUTED', '')
 
 
 class Parallel(object):
@@ -62,9 +64,11 @@ class ParallelBase(object):
 
 class Run(object):
 
-    def __init__(self, module, func, output_file, timer=False, save_path=None):
+    def __init__(self, module, func, output_file=None, timer=False, save_path=None):
         self.module = os.path.abspath(module)
         self.func = func
+        if output_file is None:
+            output_file = COMPUTED + os.path.splitext(self.module)[0] + '--' + self.func + '.pkl'
         self.output_file = output_file
         self.timer = timer
         if save_path is None:
@@ -81,7 +85,7 @@ class Run(object):
         array = (0, np.prod(self.n_iters))
         sbatch_path = self.gen_sbatch(python_script_path, array=array)
         out = subprocess.check_output(['sbatch', sbatch_path])
-
+        out = out.decode('ascii')
         out_str = 'Submitted batch job '
         assert out[:len(out_str)] == out_str
         job_id = out.split('\n')[0][len(out_str):]
@@ -100,7 +104,7 @@ class Run(object):
 
         results = self._combine_results()
         self._cleanup()
-        cPickle.dump(results, open(self.output_file, 'wb'))
+        pickle.dump(results, open(self.output_file, 'wb'))
         return results
 
     @property
@@ -119,7 +123,7 @@ class Run(object):
     def gen_python_script(self):
         mod_name = os.path.splitext(os.path.basename(self.module))[0]
         output_name = self.save_path.format('output_{}.pkl')
-        script = ('import sys, os, imp, cPickle',
+        script = ('import sys, os, imp, pickle',
                   'import numpy as np',
                   'sys.path.insert(0, "{}")',
                   'mod = imp.load_source("{}", "{}")',
@@ -130,11 +134,11 @@ class Run(object):
                   'idx = "_".join(str(v[0]) for v in idx)',
                   'os.environ["PARALLEL_IDX"] = idx',
                   'res = getattr(mod, "{}")()',
-                  'cPickle.dump(res, open("{}".format(task_id), "wb"))'
+                  'pickle.dump(res, open("{}".format(task_id), "wb"))'
                   )
         script = '\n'.join(script).format(os.getcwd(), mod_name, self.module, self.func, output_name)
         script_path = self.save_path.format('script.py')
-        with open(script_path, 'wb') as f:
+        with open(script_path, 'w') as f:
             f.write(script)
         return script_path
 
@@ -152,7 +156,7 @@ class Run(object):
         script = '\n'.join(script).format(array[0], array[1] - 1, slurm_out_file,
                                           shape, callable_path)
         sbatch_path = self.save_path.format('sbatch.sh')
-        with open(sbatch_path, 'wb') as f:
+        with open(sbatch_path, 'w') as f:
             f.write(script)
         return sbatch_path
 
@@ -164,6 +168,7 @@ class Run(object):
                 print('Squeue error. Trying again in 10 sec...')
                 time.sleep(10)  # queue busy, ask later
             else:
+                jobs = jobs.decode('ascii')
                 if not jobs.startswith('TIME'):
                     print('Unexpected squeue output. Trying again in 10 sec...')
                     time.sleep(10)  # queue busy, ask later
@@ -189,7 +194,7 @@ class Run(object):
         results = []
         for i in range(np.prod(self.n_iters)):
             outf = self.save_path.format('output_{}.pkl'.format(i))
-            res = cPickle.load(open(outf))
+            res = pickle.load(open(outf, 'rb'))
             results.append(res)
         return results
 
@@ -367,19 +372,35 @@ class MultiProcessing(ParallelBase):
         for batch_no in tqdm.trange((self.n_iter - 1) // self.n_jobs + 1):
             pool = multiprocessing.Pool(processes=self.n_jobs)
             array = range(batch_no * self.n_jobs, (batch_no+1) * self.n_jobs)
-            func_args = ([self.func, i, args, kwargs] for i in array)
-            out = pool.map(func_star, func_args)
+            if hasattr(pool, 'starmap'):
+                out = pool.starmap(self.func, ([i, args, kwargs] for i in array))
+            else:
+                func_args = ([self.func, i, args, kwargs] for i in array)
+                out = pool.map(func_star, func_args)
             pool.close()
             pool.join()
             results.extend(out)
         return results
 
 
-def func_star((func, iterno, args, kwargs)):
-        return func(iterno, *args, **kwargs)
+def func_star(args):
+    func, iterno, args, kwargs = args
+    return func(iterno, *args, **kwargs)
+
+
+def run():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('module', help='path to the Python script you want to run')
+    parser.add_argument('func', help='function to call')
+    parser.add_argument('n_iters', help='number of iterations')
+    parser.add_argument('-o', '--output_file', default=None, help='where to save the combined file')
+    parser.add_argument('--timer', default=True, action='store_true', help='whether to show a timer')
+    parser.add_argument('--save_path', default=None, help='temporary place for storing intermediate results')
+
+    args = parser.parse_args()
+    kwargs = {k:v for k,v in args.__dict__.items() if k != 'n_iters'}
+    Run(**kwargs)(eval(args.__dict__['n_iters']))
 
 
 if __name__ == '__main__':
-    Run('exps/hvm_caveats.py', 'compare_regressions_cv',
-        '/mindhive/dicarlolab/u/qbilius/computed/reg_cv_test.pkl', timer=True)([1,1])
-    # Run('exps/parallel_test_main.py', 'run', timer=True)([10])
+    run()
