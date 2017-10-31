@@ -66,6 +66,30 @@ def timeplot(data=None, x=None, y=None, hue=None,
         if data[hue].dtype.name == 'category': hues = hues.sort_values()
 
     # plt.figure()
+    if row is None:
+        row_orig = None
+        tmp = 'row_{}'
+        i = 0
+        row = tmp.format(i)
+        while row in data:
+            i += 1
+            row = tmp.format(i)
+        data[row] = 'row'
+    else:
+        row_orig = row
+
+    if col is None:
+        col_orig = None
+        tmp = 'col_{}'
+        i = 0
+        col = tmp.format(i)
+        while col in data:
+            i += 1
+            col = tmp.format(i)
+        data[col] = 'col'
+    else:
+        col_orig = col
+
     if row is not None:
         rows = data[row].unique()
         if data[row].dtype.name == 'category': rows = rows.sort_values()
@@ -117,7 +141,7 @@ def timeplot(data=None, x=None, y=None, hue=None,
     for rno, r in enumerate(rows):
         for cno, c in enumerate(cols):
             ax = axes[rno,cno]
-            for h, color in zip(hues, sns.color_palette()):
+            for h, color in zip(hues, sns.color_palette(n_colors=len(hues))):
                 if hue is None:
                     d = data
                 else:
@@ -160,21 +184,22 @@ def timeplot(data=None, x=None, y=None, hue=None,
             if ax.is_first_col():
                 ax.set_ylabel(y)
 
-            if row is None:
-                if col is None:
+            if row_orig is None:
+                if col_orig is None:
                     ax.set_title('')
                 else:
-                    ax.set_title('{} = {}'.format(col, c))
+                    ax.set_title('{} = {}'.format(col_orig, c))
             else:
-                if col is None:
-                    ax.set_title('{} = {}'.format(row, r))
+                if col_orig is None:
+                    ax.set_title('{} = {}'.format(row_orig, r))
                 else:
-                    ax.set_title('{} = {} | {} = {}'.format(row, r, col, c))
+                    ax.set_title('{} = {} | {} = {}'.format(row_orig, r, col_orig, c))
 
             if hue is not None:
                 plt.legend(loc=legend_loc, framealpha=.25)
 
     plt.tight_layout()
+    return axes
 
 
 def clean_data(df, std_thres=3, stim_dur_thres=1000./120):
