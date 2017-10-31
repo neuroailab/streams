@@ -27,15 +27,17 @@ class MatchToSampleClassifier(object):
         self.nfeats = nfeats
         self.seed = seed
 
-    def preproc(self, X):
+    def preproc(self, X, reset=False):
         if self.norm:
-            self.scaler = sklearn.preprocessing.StandardScaler().fit(X)
+            if reset:
+                self.scaler = sklearn.preprocessing.StandardScaler().fit(X)
             X = self.scaler.transform(X)
         else:
             self.scaler = None
 
         if self.nfeats is not None:
-            sel = np.random.RandomState(self.seed).permutation(X.shape[1])[:self.nfeats]
+            if reset:
+                sel = np.random.RandomState(self.seed).permutation(X.shape[1])[:self.nfeats]
             X = X[:,sel]
         return X
 
@@ -50,7 +52,7 @@ class MatchToSampleClassifier(object):
             order = np.unique(y)
         self.label_dict = OrderedDict([(obj,o) for o,obj in enumerate(order)])
         y = self.labels2inds(y)
-        X = self.preproc(X)
+        X = self.preproc(X, reset=True)
         self.clf = sklearn.svm.SVC(kernel='linear', probability=True,
                     decision_function_shape=decision_function_shape)
         self.clf.fit(X, y)
