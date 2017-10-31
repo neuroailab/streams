@@ -31,7 +31,18 @@ def nfit(model_feats, neural, labels, n_splits=10, n_components=200, test_size=.
     return df
 
 
-def internal_cons(data, niter=10, seed=None):
+def internal_cons(neural, labels, n_splits=10, test_size=.25):
+    skf = StratifiedShuffleSplit(n_splits=n_splits, test_size=test_size)
+    dfs = []
+    for it, (train_idx, test_idx) in enumerate(skf.split(neural.mean(0), labels)):
+        df = splithalf_corr(neural[:, test_idx])
+        df['split'] = it
+        dfs.append(df)
+    df = pandas.concat(dfs, ignore_index=True)
+    return df
+
+
+def splithalf_corr(data, niter=10, seed=None):
     rng = np.random.RandomState(seed)
     df = []
     for i in range(niter):
