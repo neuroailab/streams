@@ -1,5 +1,5 @@
-from __future__ import division, print_function, absolute_import
-import sys, subprocess, time, glob, os, random, string, pickle, inspect, argparse
+import sys, subprocess, time, glob, os, random, string, pickle
+import inspect, argparse, threading, signal, ast
 
 import tqdm
 import dill
@@ -7,6 +7,7 @@ import dill
 import multiprocessing
 
 import numpy as np
+import pandas
 
 COMPUTED = os.environ.get('COMPUTED', '')
 
@@ -46,6 +47,45 @@ class Parallel(object):
             return self.parallel(*args, **kwargs)
 
 
+def prange(start=0, stop=None, step=1, backend=None, **tqdm_kwargs):
+    try:
+        iter(start)
+    except TypeError:
+        rng = np.arange(start, stop, step)
+    else:
+        rng = list(start)
+
+    if backend is None:
+        if os.uname()[1].startswith('node0'):
+            backend = 'sbatch'
+
+    if backend is None:
+        return tqdm.tqdm(rng, **tqdm_kwargs)
+    elif backend == 'sbatch':
+        iternos = os.environ['PARALLEL_IDX']
+        iternos = iternos.split('_')
+        iterno = int(iternos[0])
+        if len(iternos) > 1:
+            os.environ['PARALLEL_IDX'] = '_'.join(iternos[1:])
+        return [rng[iterno]]
+    # elif backend == 'multiprocessing':
+    #     # results = []
+    #     # for batch_no in tqdm.trange((self.n_iter - 1) // self.n_jobs + 1):
+    #     pool = multiprocessing.Pool(processes=len(rng))
+    #     # array = range(batch_no * self.n_jobs, (batch_no+1) * self.n_jobs)
+    #     if hasattr(pool, 'starmap'):
+    #         out = pool.starmap(self.func, ([i, args, kwargs] for i in rng))
+    #     else:
+    #         func_args = ([self.func, i, args, kwargs] for i in rng)
+    #         out = pool.map(func_star, func_args)
+    #     pool.close()
+    #     pool.join()
+    #     # results.extend(out)
+    #     return out
+    else:
+        raise ValueError('backend "{}" not recognized'.format(backend))
+
+
 class ParallelBase(object):
 
     @property
@@ -62,45 +102,66 @@ class ParallelBase(object):
         return ''.join(random.SystemRandom().choice(chars) for _ in range(n))
 
 
-class Run(object):
+class SBatch(object):
 
-    def __init__(self, module, func, output_file=None, timer=False, save_path=None):
+    def __init__(self, module, func, output_path=None, output_name=None, timer=False, save_path=None, **func_kwargs):
         self.module = os.path.abspath(module)
         self.func = func
-        if output_file is None:
-            output_file = COMPUTED + os.path.splitext(self.module)[0] + '--' + self.func + '.pkl'
-        self.output_file = output_file
+        self.func_kwargs = func_kwargs
+
+        if output_path is None:
+            rel_path = os.path.relpath(os.path.splitext(self.module)[0], os.environ['CODE'])
+            output_path = os.path.join(COMPUTED, rel_path)
+        if not os.path.isdir(output_path):
+            os.makedirs(output_path)
+        if output_name is None:
+            output_name = self.func + '.pkl'
+        self.output_file = os.path.join(output_path, output_name)
+
         self.timer = timer
         if save_path is None:
             self._save_path = '/om/user/qbilius/tmp'  # os.getcwd()
         else:
             self._save_path = save_path
 
-        template = 'parallel_' + self.pid + '_{}'
+        template = self.pid + '_{}'
         self.save_path = os.path.join(self._save_path, template)
+
+        self._stop = threading.Event()
+        signal.signal(signal.SIGINT, self._break)
 
     def __call__(self, n_iters):
         python_script_path = self.gen_python_script()
-        self.n_iters = n_iters
+        try:
+            iter(n_iters)
+        except:
+            self.n_iters = [n_iters]
+        else:
+            self.n_iters = n_iters
         array = (0, np.prod(self.n_iters))
         sbatch_path = self.gen_sbatch(python_script_path, array=array)
         out = subprocess.check_output(['sbatch', sbatch_path])
         out = out.decode('ascii')
         out_str = 'Submitted batch job '
         assert out[:len(out_str)] == out_str
-        job_id = out.split('\n')[0][len(out_str):]
-        self.sbatch_progress(job_id)
+        self.job_id = out.split('\n')[0][len(out_str):]
+        self.sbatch_progress()
 
-        # check if output file was created; if not, there must have been an error
-        for i in range(array[0], array[1]):
-            outf = self.save_path.format('output_{}.pkl'.format(i))
-            if not os.path.isfile(outf):
-                with open(self.save_path.format('slurm_{}.out'.format(i))) as f:
-                    msg = f.read()
-                print()
-                print(msg)
-                sys.exit()
-                # raise Exception('Output file {} not found. See error log above.'.format(outf))
+        if not self._stop.is_set():
+            # check if output file was created; if not, there must have been an error
+            for i in range(array[0], array[1]):
+                outf = self.save_path.format('output_{}.pkl'.format(i))
+                if not os.path.isfile(outf):
+                    with open(self.save_path.format('slurm_{}.out'.format(i))) as f:
+                        msg = f.read()
+                    print()
+                    print(msg)
+                    self._cleanup()
+                    sys.exit()
+        else:
+            print('cleaning up...')
+            self._cleanup()
+            sys.exit()
 
         results = self._combine_results()
         self._cleanup()
@@ -133,10 +194,18 @@ class Run(object):
                   'idx = np.nonzero(np.arange(n_iters).reshape(sh)==task_id)',
                   'idx = "_".join(str(v[0]) for v in idx)',
                   'os.environ["PARALLEL_IDX"] = idx',
-                  'res = getattr(mod, "{}")()',
+                  'res = getattr(mod, "{}")({})',
                   'pickle.dump(res, open("{}".format(task_id), "wb"))'
                   )
-        script = '\n'.join(script).format(os.getcwd(), mod_name, self.module, self.func, output_name)
+        kwargs = []
+        for k,v in self.func_kwargs.items():
+            if isinstance(k, str):
+                inp = '{}="{}"'.format(k, v)
+            else:
+                inp = '{}={}'.format(k, v)
+            kwargs.append(inp)
+        kwargs = ', '.join(kwargs)
+        script = '\n'.join(script).format(os.getcwd(), mod_name, self.module, self.func, kwargs, output_name)
         script_path = self.save_path.format('script.py')
         with open(script_path, 'w') as f:
             f.write(script)
@@ -148,7 +217,8 @@ class Run(object):
                   '#SBATCH --array={}-{}',
                   '#SBATCH --time=7-00:00:00',
                   '#SBATCH --ntasks=1',
-                  '#SBATCH --cpus-per-task=16',
+                  '#SBATCH --cpus-per-task=1',
+                  '#SBATCH --mem=100G',
                   '#SBATCH --output="{}"',
                   'export PARALLEL_SHAPE={}',
                   'python "{}" $SLURM_ARRAY_TASK_ID')
@@ -160,35 +230,84 @@ class Run(object):
             f.write(script)
         return sbatch_path
 
-    def sbatch_progress(self, job_id):
-        while True:
+    def sbatch_progress_orig(self, job_id):
+        while not self._stop.is_set():
             try:
                 jobs = subprocess.check_output('squeue -o %M -j {}'.format(job_id).split())
             except:
                 print('Squeue error. Trying again in 10 sec...')
-                time.sleep(10)  # queue busy, ask later
+                self._stop.wait(10)  # queue busy, ask later
             else:
                 jobs = jobs.decode('ascii')
                 if not jobs.startswith('TIME'):
                     print('Unexpected squeue output. Trying again in 10 sec...')
-                    time.sleep(10)  # queue busy, ask later
+                    self._stop.wait(10)  # queue busy, ask later
                 elif len(jobs.split('\n')) > 2:  # still running
                     if self.timer:
                         t = jobs.split('\n')[-2]
                         print('\rJob {} (id: {}): {}'.format(job_id, self.pid, t), end='')
                         sys.stdout.flush()
-                    time.sleep(10)
+                    self._stop.wait(10)
                 else:
                     break
         if self.timer:
             print()
 
+    def sbatch_progress(self, wait=10):
+        if self.timer:
+            os.system('setterm -cursor off')
+        while not self._stop.is_set():
+            try:
+                cmd = 'sacct -j {} -o State -X'.format(self.job_id).split()
+                jobs = subprocess.check_output(cmd)
+            except:
+                print('\rSqueue error. Trying again in {} sec...'.format(wait),
+                      end='', flush=True)
+                self._stop.wait(wait)  # queue busy, ask later
+            else:
+                jobs = jobs.decode('ascii')
+                if not jobs.startswith('     State'):
+                    print('\rUnexpected squeue output. Trying again in {} sec...'.format(wait),
+                          end='', flush=True)
+                    self._stop.wait(wait)  # queue busy, ask later
+                else:
+                    status = jobs.split('\n')[2:-1]
+                    count = {}
+                    for st in status:
+                        st = st.strip('\r\n').lstrip().rstrip()
+                        if st in count:
+                            count[st] += 1
+                        else:
+                            count[st] = 1
+                    status = ', '.join(['{}: {}'.format(k,v) for k,v in count.items()])
+                    if self.timer:
+                        print('\r' + ' ' * 79, end='')
+                        print('\rJob {} (id: {}) -- {}'.format(self.job_id, self.pid, status),
+                              end='', flush=True)
+                    if 'COMPLETED' in count and len(count) == 1:
+                        break
+                    self._stop.wait(wait)
+
+        if self.timer:
+            os.system('setterm -cursor on')
+            print()
+
+    def _break(self, signum, frame):
+        self._stop.set()
+        subprocess.check_output(['scancel', self.job_id])
+
     def _cleanup(self):
         for fname in ['sbatch.sh', 'script.py']:
-            os.remove(self.save_path.format(fname))
+            try:
+                os.remove(self.save_path.format(fname))
+            except:
+                pass
         for fname in ['slurm_{}.out', 'output_{}.pkl']:
             for i in range(np.prod(self.n_iters)):
-                os.remove(self.save_path.format(fname).format(i))
+                try:
+                    os.remove(self.save_path.format(fname).format(i))
+                except:
+                    pass
 
     def _combine_results(self):
         results = []
@@ -196,6 +315,11 @@ class Run(object):
             outf = self.save_path.format('output_{}.pkl'.format(i))
             res = pickle.load(open(outf, 'rb'))
             results.append(res)
+
+        try:
+            results = pandas.concat(results, ignore_index=True)
+        except:
+            pass
         return results
 
 
@@ -393,13 +517,22 @@ def run():
     parser.add_argument('module', help='path to the Python script you want to run')
     parser.add_argument('func', help='function to call')
     parser.add_argument('n_iters', help='number of iterations')
-    parser.add_argument('-o', '--output_file', default=None, help='where to save the combined file')
+    parser.add_argument('-o', '--output_name', default=None, help='combined file name')
+    parser.add_argument('--output_path', '--output_path', default=None, help='where to save the combined file')
+    # parser.add_argument('-p', '--output_prefix', default='', help='prefix to the output path')
     parser.add_argument('--timer', default=True, action='store_true', help='whether to show a timer')
     parser.add_argument('--save_path', default=None, help='temporary place for storing intermediate results')
 
-    args = parser.parse_args()
+    args, func_args = parser.parse_known_args()
+    func_kwargs = {k.strip('-'):v for k,v in zip(*[iter(func_args)] * 2)}
+    for k, v in func_kwargs.items():
+        try:
+            func_kwargs[k] = ast.literal_eval(v)
+        except:
+            pass
     kwargs = {k:v for k,v in args.__dict__.items() if k != 'n_iters'}
-    Run(**kwargs)(eval(args.__dict__['n_iters']))
+    kwargs.update(func_kwargs)
+    SBatch(**kwargs)(eval(args.__dict__['n_iters']))
 
 
 if __name__ == '__main__':
