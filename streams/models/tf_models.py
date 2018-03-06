@@ -14,19 +14,21 @@ class Model(base.Model):
     # KNOWN_MODELS = {'basenet6': ('basenet6', 'BaseNet6', (224, 224)),
     #                 'basenet11': ('basenet11', 'BaseNet11', (224, 224))}
 
-    def __init__(self, batch_size=256, model_func=None, path=None, *args, **kwargs):
+    def __init__(self, batch_size=256, model_func=None, checkpoint=None,
+                 targets=None, *args, **kwargs):
         self.batch_size = batch_size
         self.model_func = model_func
-        self.path = path
+        self.checkpoint = checkpoint
+        self.targets = targets
+        self.shape = (224,224) #specs[2]
         super(Model, self).__init__(*args, **kwargs)
 
     def create_model(self, model_name):
         # specs = self.KNOWN_MODELS[model_name]
-        self.shape = (224,224) #specs[2]
-        self.placeholder = tf.placeholder(shape=(256,224,224,3), dtype=tf.float32)
+        # self.placeholder = tf.placeholder(shape=(self.batch_size,224,224,3), dtype=tf.float32)
 
-        if self.path is None:
-            self.path = '/braintree/home/qbilius/models/{}/model.ckpt-100000'.format(model_name)
+        if self.checkpoint is None:
+            self.checkpoint = '/braintree/home/qbilius/models/{}/model.ckpt-100000'.format(model_name)
 
         # if model_name == 'basenet6':
         #     prefix = 'hvm_nfit_and_corr'
@@ -44,18 +46,42 @@ class Model(base.Model):
             else:
                 raise ValueError
 
+        self.placeholder = tf.placeholder(shape=(None,224,224,3), dtype=tf.float32)
         self.model_func(self.placeholder)
+        # NEW
+        # self.placeholder = tf.placeholder(shape=(None,), dtype=tf.string)
+        # self.iterator = self.data(self.placeholder)
+        # self.model_func(self.iterator.get_next())
 
         saver = tf.train.Saver()  #var_list=restore_vars())
         self.sess = tf.Session()
-        saver.restore(self.sess, save_path=self.path)
+        saver.restore(self.sess, save_path=self.checkpoint)
         graph = tf.get_default_graph()
-        self.targets = {l: graph.get_tensor_by_name('{}/output:0'.format(l)) for l in self.layers}
+        if self.targets is None:
+            self.targets = {l: graph.get_tensor_by_name('{}/output:0'.format(l)) for l in self.layers}
 
         # path = getattr(keras.applications, specs[0])
         # net = getattr(path, specs[1])(weights='imagenet')
         # outputs = [net.get_layer(layer).output for layer in self.layers]
         # self.net = keras.models.Model(inputs=net.input, outputs=outputs)
+
+    def _get_features_new(self, filenames):
+
+        output = []  # {k:[] for k in self.layers}
+        self.sess.run(self.iterator.initializer, feed_dict={self.placeholder: filenames})
+        pbar = tqdm.tqdm()
+        while True:
+            try:
+                out = self.sess.run(self.targets)
+            except tf.errors.OutOfRangeError:
+                break
+            output.append(out)
+            pbar.update(1)
+
+        resps = OrderedDict()
+        for layer in self.layers:
+            resps[layer] = np.row_stack([o[layer] for o in output])
+        return resps
 
     def _get_features(self, ims):
         if ims[0].shape[0] != 224:
@@ -87,6 +113,22 @@ class Model(base.Model):
     def preprocess(self, ims):
         ims = np.array([skimage.transform.resize(im, self.shape) for im in ims])
         return ims
+
+    def data(self, filenames):
+        ds = tf.data.Dataset.from_tensor_slices(filenames)
+        ds = ds.map(self.parse_data, num_parallel_calls=1)
+        ds = ds.batch(self.batch_size)
+        ds = ds.repeat(1)
+        iterator = ds.make_initializable_iterator()
+        return iterator
+
+    def parse_data(self, filename):
+        # return filename
+        im = tf.read_file(filename)
+        im = tf.image.decode_png(im, channels=3)
+        im = tf.image.convert_image_dtype(im, dtype=tf.float32)
+        im = tf.image.resize_images(im, (224, 244))
+        return im
 
     # @property
     # def pca_ims(self):

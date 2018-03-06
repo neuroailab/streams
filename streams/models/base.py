@@ -4,13 +4,13 @@ import numpy as np
 
 class Model(object):
 
-    def __init__(self, model_name='vgg-19', layers=None, feat_sel=None):
+    def __init__(self, name='vgg-19', layers=None, feat_sel=None):
         """
         Generic model interface
         """
-        self.model_name = model_name
+        self.model_name = name
         self.layers = layers
-        self.create_model(model_name)
+        self.create_model(name)
         self.feat_sel = feat_sel
 
     @property

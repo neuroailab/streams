@@ -18,9 +18,10 @@ class FeatureSelector(object):
 
 class PCASelector(FeatureSelector):
 
-    def __init__(self, ims=None, nfeats=1000, nimg=1000):
+    def __init__(self, ims=None, nfeats=1000, nimg=1000, random_state=0):
         self.nfeats = nfeats
         self.nimg = nimg
+        self.random_state = random_state
 
     def _pca_fit(self, m):
         ims = self._get_imagenet_val(nimg=self.nimg)
@@ -34,7 +35,8 @@ class PCASelector(FeatureSelector):
 
         self.pca = []
         for layer, feats in tqdm.tqdm(features.items(), desc='PCA'):
-            pca = sklearn.decomposition.PCA(n_components=self.nfeats)
+            pca = sklearn.decomposition.PCA(n_components=self.nfeats,
+                                            random_state=self.random_state)
             pca.fit(feats.reshape((len(feats), -1)))
             self.pca.append((layer, pca))
         self.pca = OrderedDict(self.pca)
@@ -57,7 +59,7 @@ class PCASelector(FeatureSelector):
         for i in range((nimg - 1) % 1000 + 1):
             idx.extend(50 * i + np.array([n_img_per_class]).astype(int))
 
-        with h5py.File('/braintree/data2/active/users/qbilius/data/imagenet2012.hdf5') as f:
+        with h5py.File('/braintree/data2/active/users/qbilius/datasets/imagenet2012.hdf5', 'r') as f:
             ims = np.array([skimage.transform.resize(f['val/images'][i], (256,256)) for i in idx])
         return ims
 
