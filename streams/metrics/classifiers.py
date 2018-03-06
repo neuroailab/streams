@@ -2,12 +2,15 @@ from collections import OrderedDict
 
 import numpy as np
 import scipy.stats
-import sklearn, sklearn.svm, sklearn.preprocessing
+import pandas
+import sklearn, sklearn.svm, sklearn.preprocessing, sklearn.linear_model
+
+import streams.utils
 
 
 class MatchToSampleClassifier(object):
 
-    def __init__(self, norm=True, nfeats=None, seed=None):
+    def __init__(self, norm=True, nfeats=None, seed=None, C=1):
         """
         A classifier for the Delayed Match-to-Sample task.
 
@@ -26,6 +29,7 @@ class MatchToSampleClassifier(object):
         self.norm = norm
         self.nfeats = nfeats
         self.seed = seed
+        self.C = C
 
     def preproc(self, X, reset=False):
         if self.norm:
@@ -41,20 +45,21 @@ class MatchToSampleClassifier(object):
             X = X[:,sel]
         return X
 
-    def fit(self, X, y, order=None, decision_function_shape='ovo'):
+    def fit(self, X, y, order=None):#, decision_function_shape='ovo'):
         """
         :Kwargs:
             - order
                 Label order. If None, will be sorted alphabetically
         """
-        self.decision_function_shape = decision_function_shape
+        # self.decision_function_shape = decision_function_shape
         if order is None:
             order = np.unique(y)
         self.label_dict = OrderedDict([(obj,o) for o,obj in enumerate(order)])
         y = self.labels2inds(y)
         X = self.preproc(X, reset=True)
-        self.clf = sklearn.svm.SVC(kernel='linear', probability=True,
-                    decision_function_shape=decision_function_shape)
+        # self.clf = sklearn.svm.SVC(kernel='linear', probability=True,
+        #             decision_function_shape='ovr', C=self.C)#decision_function_shape)
+        self.clf = sklearn.linear_model.LogisticRegression(multi_class='multinomial', solver='newton-cg', C=self.C)
         self.clf.fit(X, y)
 
     def _acc(self, x, y):
@@ -63,7 +68,7 @@ class MatchToSampleClassifier(object):
     def _dprime(self, x, y):
         return scipy.stats.norm.ppf(x) - scipy.stats.norm.ppf(y)
 
-    def predict_proba(self, X, targets=None, distrs=None, kind='n-way', measure='acc'):
+    def predict_proba(self, X, targets=None, distrs=None, kind='2-way', measure='acc'):
         """
         Model classification confidence (range 0-1)
         """
@@ -77,6 +82,7 @@ class MatchToSampleClassifier(object):
 
         X = self.preproc(X)
         conf = self.clf.predict_proba(X)
+        # conf = self.clf.decision_function(X)
 
         if targets is not None:
             if isinstance(targets, str):
@@ -88,9 +94,9 @@ class MatchToSampleClassifier(object):
             if distrs is not None:
                 if isinstance(distrs, str):
                     distrs = [distrs]
-                di = self.labels2inds(distrs)
+                dinds = self.labels2inds(distrs)
                 # distractor probability
-                d = np.array([x[i] for x, i in zip(conf, di)])
+                d = np.array([c[di] for c, di in zip(conf, dinds)])
                 acc = measure_op(t, d)
 
             elif kind == '2-way':
@@ -103,11 +109,12 @@ class MatchToSampleClassifier(object):
                         if di != ti:
                             tmp = measure_op(c[ti], c[di])
                             c_tmp.append(tmp)
+                            # c_tmp.append(c[di])
                         else:
                             # c_tmp.append(c[ti])
                             c_tmp.append(np.nan)
-                    acc.append(c_tmp)  #np.mean(c_tmp))
-                acc = np.array(acc)
+                    acc.append(c_tmp)
+                acc = pandas.DataFrame(acc, index=targets, columns=list(self.label_dict.keys()))
 
             else:
                 acc = t
@@ -122,7 +129,7 @@ class MatchToSampleClassifier(object):
         """
         return np.array([self.label_dict[x] for x in y])
 
-    def score(self, X, y, kind='n-way'):
+    def score(self, X, y, kind='2-way', measure='dprime', cap=5):
         """
         Classification accuracy.
 
@@ -137,6 +144,11 @@ class MatchToSampleClassifier(object):
             conf = self.predict_proba(X, kind=kind)
             y = self.labels2inds(y)
             acc = np.argmax(conf, 1) == y
+
+        if measure == 'dprime':
+            import ipdb; ipdb.set_trace()
+            acc = streams.utils.hitrate_to_dprime_o1(acc, cap=cap)
+
         return acc
 
 
