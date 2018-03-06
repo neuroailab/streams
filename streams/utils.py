@@ -1,4 +1,4 @@
-from __future__ import division, print_function, absolute_import
+import functools
 
 import numpy as np
 import scipy.stats
@@ -228,3 +228,140 @@ def clean_data(df, std_thres=3, stim_dur_thres=1000./120):
     print('Stimulus presentation too slow: {} out of {}'.format(len(df) - good_present_time.sum(), len(df)))
     df = df[fast_rts & good_present_time]
     return df
+
+
+def lazy_property(function):
+    """
+    From: https://danijar.com/structuring-your-tensorflow-models/
+    """
+    attribute = '_cache_' + function.__name__
+
+    @property
+    @functools.wraps(function)
+    def decorator(self):
+        if not hasattr(self, attribute):
+            setattr(self, attribute, function(self))
+        return getattr(self, attribute)
+
+    return decorator
+
+
+# def hitrate_to_dprime(df, cap=5):
+#     # df = pandas.DataFrame(hitrate, index=labels, columns=order)
+#     out = np.zeros_like(df)
+#     for (i,j), hit_rate in np.ndenumerate(df.values):
+#         target = df.index[i]
+#         distr = df.columns[j]
+#         if target == distr:
+#             dprime = np.nan
+#         else:
+#             miss_rate = df.loc[df.index == target, distr].mean()
+#             hit = hit_rate / (hit_rate + miss_rate)
+#             fa_rate = df.loc[df.index == distr, target].mean()
+#             rej_rate = df.loc[df.index == distr, distr].mean()
+#             fa = fa_rate / (fa_rate + rej_rate)
+#             dprime = scipy.stats.norm.ppf(hit) - scipy.stats.norm.ppf(fa)
+#             if dprime > cap: dprime = cap
+#         out[i,j] = dprime
+
+#     return out
+
+
+def hitrate_to_dprime_o1(df, cap=20):
+    # df = pandas.DataFrame(hitrate, index=labels, columns=order)
+    targets = df.index.unique()
+    # distrs = df.columns.unique()
+    # out = pandas.DataFrame(np.zeros([len(targets), len(distrs)]), index=targets, columns=distrs)
+    out = pandas.Series(np.zeros(len(targets)), index=targets)
+    for target in targets:
+        # if target == 'lo_poly_animal_RHINO_2': import ipdb; ipdb.set_trace()
+        hit_rate = np.nanmean(df.loc[df.index == target])
+        # miss_rate = 1 - np.nanmean(df.loc[df.index == target])
+        fa_rate = np.nanmean(1 - df.loc[df.index != target, target])
+        dprime = scipy.stats.norm.ppf(hit_rate) - scipy.stats.norm.ppf(fa_rate)
+        dprime = np.clip(dprime, -cap, cap)
+        out[target] = dprime
+    return out
+    #     for distr in distrs:
+    # # for (i,j), hit_rate in np.ndenumerate(df.values):
+    #         if target == distr:
+    #             dprime = np.nan
+    #         else:
+    #             hit_rate = df.loc[df.index == target].mean()
+    #             miss_rate = df.loc[df.index == target, distr].mean()
+    #             hit = hit_rate / (hit_rate + miss_rate)
+    #             fa_rate = df.loc[df.index == distr, target].mean()
+    #             rej_rate = df.loc[df.index == distr, distr].mean()
+    #             fa = fa_rate / (fa_rate + rej_rate)
+    #             dprime = scipy.stats.norm.ppf(hit) - scipy.stats.norm.ppf(fa)
+    #             if dprime > cap: dprime = cap
+    #         out[target, distr] = dprime
+
+    # return out
+
+
+
+
+
+def hitrate_to_dprime_i1n(df, cap=20, normalize=True):
+    out = pandas.Series(np.zeros(len(df)),
+                        index=df.set_index(['obj', 'id']).index)
+    for (target, idd), row in df.iterrows():
+        hit_rate = row.acc
+        # miss_rate = 1 - np.nanmean(df.loc[df.index == target])
+        rej = df.loc[df.obj != target, target]
+        fa_rate = 1 - np.nanmean(rej)
+        dprime = scipy.stats.norm.ppf(hit_rate) - scipy.stats.norm.ppf(fa_rate)
+        dprime = np.clip(dprime, -cap, cap)
+        out.loc[(target, idd)] = dprime
+
+    if normalize:
+        out.acc -= out.groupby('obj').acc.transform(lambda x: x.mean())
+    return out
+
+
+def hitrate_to_dprime_i2n(df, cap=20):
+    # df = pandas.DataFrame(hitrate, index=labels, columns=order)
+    # targets = df.index.unique()
+    # distrs = df.columns.unique()
+    # out = pandas.DataFrame(np.zeros([len(targets), len(distrs)]), index=targets, columns=distrs)
+    # df = df.set_index(['obj', 'id', 'distr'])
+    # out = pandas.DataFrame(np.zeros(len(df), len(df.distr.unique()), index=df.index, columns=df.columns)
+    out = df.set_index(['obj', 'id', 'distr']).copy()
+    for (target, idd, distr), hit_rate in out.iterrows():
+
+        if target == distr:
+            out.loc[(target, idd, distr)] = np.nan
+        else:
+            # if target == 'lo_poly_animal_RHINO_2': import ipdb; ipdb.set_trace()
+            # hit_rate = acc
+            # miss_rate = 1 - np.nanmean(df.loc[df.index == target])
+            rej = df.loc[(df.obj == distr) & (df.distr == target), 'acc']
+            # import ipdb; ipdb.set_trace()
+            fa_rate = 1 - np.nanmean(rej)
+            dprime = scipy.stats.norm.ppf(hit_rate) - scipy.stats.norm.ppf(fa_rate)
+
+            # if target == 'lo_poly_animal_RHINO_2' and distr == 'MB30758' and idd == 'e387f6375d1d01a92f02394ea0c2c89de4ec4f61':
+            #     import ipdb; ipdb.set_trace()
+
+            # hit_rate_norm = np.nanmean(df.loc[(df.obj == target) & (df.distr == distr), 'acc'])
+            # dprime_norm = scipy.stats.norm.ppf(hit_rate_norm) - scipy.stats.norm.ppf(fa_rate)
+
+            # dprime -= dprime_norm
+
+            out.loc[(target, idd, distr)] = dprime
+
+    # def ff(x):
+    #     import ipdb; ipdb.set_trace()
+    #     return x.mean()
+
+    out = out.reset_index()
+    out.acc -= out.groupby(['obj', 'distr']).acc.transform(lambda x: x.mean())
+    out.acc = np.clip(out.acc, -cap, cap)
+
+    # for (target, idd, distr), dprime in out.iterrows():
+
+    #     out.loc[(target, idd, distr)] = dprime
+
+    # dprime = np.clip(dprime, -cap, cap)
+    return out
