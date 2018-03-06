@@ -1,6 +1,10 @@
 import os, glob, hashlib
 import tqdm
 import boto3
+import numpy as np
+import pandas
+import skimage.io, skimage.color, skimage.transform
+
 
 DATA_HOME = os.path.abspath(os.path.expanduser(os.environ.get(
                 'STREAMS_ROOT', os.path.join('/braintree/home/qbilius', '.streams'))))
@@ -59,6 +63,7 @@ class Dataset(object):
                             raise IOError("File '{}': SHA-1 does not match.".format(filename))
 
     def upload(self, pattern='*'):
+        raise NotImplementedError
         session = boto3.Session()
         client = session.client('s3')
 
@@ -96,8 +101,43 @@ class Dataset(object):
         s3_path = os.path.join(self.COLL, rel_path)
         client.upload_file(local_path, self.BUCKET, s3_path)
 
-
     # def move(self, old_path, new_path):
     #     client.copy_object(Bucket=self.BUCKET, Key=new_path,
     #                         CopySource=self.BUCKET + '/' + old_path)
     #     client.delete_object(Bucket=self.BUCKET, Key=new_path)
+
+    @property
+    def meta(self):
+        if not hasattr(self, '_meta'):
+            self.fetch()
+            self._meta = pandas.read_pickle(self.datapath('meta'))
+        return self._meta
+
+    def images(self, size=256):
+        try:
+            ims = np.load(self.datapath('images{}'.format(size)))
+        except:
+            ims = []
+            for idd in tqdm.tqdm(self.meta.id.values, desc='processing images'):
+                im = skimage.io.imread(self.home('imageset/images', idd + '.png'))
+                im = skimage.transform.resize(im, (size, size))
+                assert im.min() >= 0
+                assert im.max() <= 1
+                im = skimage.color.gray2rgb(im)
+                assert im.ndims == 3
+                ims.append(im)
+            ims = np.array(ims)
+            np.save(self.datapath('images{}'.format(size)), ims)
+        return ims
+
+    def tokens(self, size=256):
+        ims = []
+        for idd in self.meta.obj.unique():
+            im = skimage.io.imread(self.home('imageset/images', idd + '.png'))
+            im = skimage.transform.resize(im, (size, size))
+            assert im.min() >= 0
+            assert im.max() <= 1
+            im = skimage.color.gray2rgb(im)
+            assert im.ndims == 3
+            ims.append(im)
+        ims = np.array(ims)
