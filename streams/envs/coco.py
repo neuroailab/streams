@@ -1,4 +1,4 @@
-import os, functools, glob
+import os, glob
 from collections import OrderedDict
 
 import tqdm
@@ -7,25 +7,10 @@ import pandas
 import skimage, skimage.io, skimage.transform
 
 from streams.envs.dataset import Dataset, DATA_HOME
+from streams.utils import lazy_property
 
 
 COCO_PATH = '/braintree/data2/active/common/coco/'
-
-
-def lazy_property(function):
-    """
-    From: https://danijar.com/structuring-your-tensorflow-models/
-    """
-    attribute = '_cache_' + function.__name__
-
-    @property
-    @functools.wraps(function)
-    def decorator(self):
-        if not hasattr(self, attribute):
-            setattr(self, attribute, function(self))
-        return getattr(self, attribute)
-
-    return decorator
 
 
 class COCO(Dataset):
@@ -114,12 +99,30 @@ class COCO(Dataset):
 
 class COCO10(COCO):
     NAMES = ['bear', 'elephant', 'person', 'car', 'dog', 'apple', 'chair', 'airplane', 'bird', 'zebra']
-    DATA = {'meta': 'streams/coco/meta.pkl'}
+    DATA = {'meta': 'streams/coco10/meta.pkl'}
+
+    def __init__(self):
+        self.name = 'coco10'
 
     def create_meta(self):
-        recs = [self.db[self.db.category == n].iloc[:200] for n in self.NAMES]
+
+        def obj_area(df, x):
+            sel = df.loc[x.index]
+            out = sel[sel.category == name]
+            return out.area.max()
+
+        recs = []
+        self.db
+        for name in tqdm.tqdm(self.NAMES):
+            df = self.db[(self.db.category == name) & (self.db.iscrowd == 0)].copy()
+            assert len(df) >= 1000
+            ims = self.db[self.db.image_id.isin(df.image_id)]
+            df['obj_area'] = ims.groupby('image_id').area.transform(lambda x: obj_area(df, x))
+            df['n_objs'] = ims.groupby('image_id').category.transform(len)
+            df['n_rep_obj'] = ims.groupby('image_id').category.transform(lambda x: (x == name).sum())
+            df = df.sort_values(by=['area', 'n_objs', 'n_rep_obj'], ascending=[False, True, True])
+            recs.append(df.iloc[:1000])
         recs = pandas.concat(recs, ignore_index=True)
-        recs.loc[recs.category == 'person', 'category'] = 'face'
         recs.to_pickle(self.datapath('meta'))
 
     @lazy_property
@@ -127,13 +130,12 @@ class COCO10(COCO):
         meta = pandas.read_pickle(self.datapath('meta'))
         return meta
 
-    @lazy_property
-    def images(self):
+    def images(self, size=224):
         ims = []
         for idx, row in tqdm.tqdm(self.meta.iterrows()):
             im = skimage.io.imread(os.path.join(COCO_PATH, row.kind + '2014', row.file_name))
             im = skimage.color.gray2rgb(im)
-            im = skimage.transform.resize(im, (256,256))
+            im = skimage.transform.resize(im, (size,size))
             im = skimage.img_as_float(im)
             ims.append(im)
         return np.array(ims)
